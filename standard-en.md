@@ -1,5 +1,5 @@
 # lawgit Legal Document Data Specification
-**Version 1.0**
+**Version 1.1**
 
 ## 1. Purpose
 
@@ -85,6 +85,8 @@ The official legal number MUST be treated as metadata, not as a primary identifi
         <name>Legal Document Name</name>
         <law-number>Official Legal Number</law-number>
         <type>Act</type>
+        <promulgated-date>2026-01-15</promulgated-date>
+        <effective-date>2026-04-01</effective-date>
     </metadata>
 
     <body>
@@ -123,6 +125,8 @@ Contains basic information about the legal document.
 | `name` | Required | Legal document name |
 | `law-number` | Optional | Official legal number |
 | `type` | Required | Legal document type |
+| `promulgated-date` | Optional | Promulgation date of this legal instrument (YYYY-MM-DD) |
+| `effective-date` | Optional | Commencement date of this legal instrument (YYYY-MM-DD) |
 
 The `type` element MUST identify the type of legal document.
 
@@ -176,6 +180,21 @@ Changes to legal documents MUST be recorded using Git commits.
 | Tag | Identification of a specific repository state |
 
 The lawgit UUID MUST remain independent of Git commit hashes.
+
+### 7.1 Amendment Commit Dates
+
+For an amendment commit, the promulgation date of the amending law MUST be used for both the Git author date and committer date. The time is set to 00:00 Japan Standard Time.
+
+The commencement date(s) of the amendment MUST be recorded as commit-message trailers.
+
+```text
+Partial Amendment to the Road Traffic Act
+
+LawGit-Amendment-Promulgated-Date: 2026-11-05
+LawGit-Effective-Date: 2026-12-01
+```
+
+When commencement is staggered, repeat `LawGit-Effective-Date` once for each date. This keeps the legal instrument's original dates separate from the dates of subsequent amendments.
 
 ## 8. Data Integrity
 
