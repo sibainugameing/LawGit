@@ -90,6 +90,45 @@ Use one commit for one amendment. When one amending act changes multiple legal d
 
 Use branches for proposed amendments and merge them when the proposal is adopted. Use Git tags when a named repository state must be retained.
 
+## User-authored rule documents
+
+LawGit can manage user-authored rules and policy documents separately from legal documents. Rule documents are stored in `rules/<UUID>.xml`; they do not use the legal-document schema in `laws/`.
+
+Create a rule interactively:
+
+~~~sh
+lawgit rule make
+~~~
+
+Enter the rule name and category, then enter the body. The body accepts Markdown text. Finish body input by entering a single dot (`.`) on its own line; enter two dots (`..`) to insert a literal dot line.
+
+Manage existing rules:
+
+~~~sh
+lawgit rule list
+lawgit rule show <UUID>
+lawgit rule validate
+~~~
+
+The XML file path is shown after creation and in the list output. Edit that file with a text editor. Use Git to review and record changes:
+
+~~~sh
+git diff -- rules/
+git add rules/<UUID>.xml
+git commit -m "Update rule: <rule name>"
+~~~
+
+Each rule receives an immutable UUID v4. Its name and category are metadata, not identifiers. Rule documents have their own XML root (`rule`) and validation; they are kept separate from legal documents.
+
+The same commands are available through the Git subcommand:
+
+~~~sh
+git law rule make
+git law rule list
+git law rule show <UUID>
+git law rule validate
+~~~
+
 ## Current commands
 
 | Command | Purpose |
