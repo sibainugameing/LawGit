@@ -1,10 +1,12 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use std::io::Read;
 use std::path::PathBuf;
 
 use lawgit::{
-    create_law, init_repository, list_laws, list_rules, prompt_and_create_rule, read_law,
-    read_rule, validate_repository, validate_rule_repository, NewLaw,
+    amend_law, create_law, init_repository, list_laws, list_rules, prompt_and_create_rule,
+    read_law, read_rule, validate_repository, validate_rule_repository, Amendment,
+    AmendmentChange, NewLaw,
 };
 
 #[derive(Parser)]
@@ -44,6 +46,41 @@ enum Commands {
         /// e-Gov Legal ID, when available.
         #[arg(long = "e-gov-id")]
         e_gov_id: Option<String>,
+
+        /// Original promulgation date (YYYY-MM-DD).
+        #[arg(long = "promulgated-date")]
+        promulgated_date: Option<String>,
+
+        /// Original commencement date (YYYY-MM-DD).
+        #[arg(long = "effective-date")]
+        effective_date: Option<String>,
+    },
+
+    /// Apply one amendment from a complete XML file or unified diff and commit it.
+    Amend {
+        /// lawgit UUID v4 of the existing legal document.
+        #[arg(long)]
+        uuid: String,
+
+        /// Complete replacement XML file, or - to read from stdin.
+        #[arg(long, conflicts_with = "patch")]
+        input: Option<PathBuf>,
+
+        /// Unified diff for laws/<UUID>.xml, or - to read from stdin.
+        #[arg(long, conflicts_with = "input")]
+        patch: Option<PathBuf>,
+
+        /// Promulgation date of the amending law (YYYY-MM-DD).
+        #[arg(long = "promulgated-date")]
+        promulgated_date: String,
+
+        /// Commencement date(s) of the amendment. May be supplied more than once.
+        #[arg(long = "effective-date", action = clap::ArgAction::Append)]
+        effective_dates: Vec<String>,
+
+        /// Git commit message describing the amendment.
+        #[arg(long)]
+        message: String,
     },
 
     /// Validate every XML document in the laws directory.
@@ -90,6 +127,19 @@ fn main() {
     }
 }
 
+fn read_payload(path: &PathBuf) -> Result<String> {
+    if path == &PathBuf::from("-") {
+        let mut content = String::new();
+        std::io::stdin()
+            .read_to_string(&mut content)
+            .context("failed to read input from stdin")?;
+        Ok(content)
+    } else {
+        std::fs::read_to_string(path)
+            .with_context(|| format!("cannot read input file: {}", path.display()))
+    }
+}
+
 fn run() -> Result<()> {
     let cli = Cli::parse();
 
@@ -104,6 +154,8 @@ fn run() -> Result<()> {
             law_type,
             law_number,
             e_gov_id,
+            promulgated_date,
+            effective_date,
         } => {
             let law = create_law(
                 &cli.repo,
@@ -112,12 +164,39 @@ fn run() -> Result<()> {
                     law_type,
                     law_number,
                     e_gov_id,
+                    promulgated_date,
+                    effective_date,
                 },
             )?;
             println!("Registered: {}", law.name);
             println!("UUID:      {}", law.uuid);
             println!("File:      {}", law.path.display());
             println!("Edit the XML body, then run lawgit validate before committing.");
+        }
+        Commands::Amend {
+            uuid,
+            input,
+            patch,
+            promulgated_date,
+            effective_dates,
+            message,
+        } => {
+            let change = match (input, patch) {
+                (Some(path), None) => AmendmentChange::CompleteXml(read_payload(&path)?),
+                (None, Some(path)) => AmendmentChange::UnifiedDiff(read_payload(&path)?),
+                _ => anyhow::bail!("specify exactly one of --input or --patch"),
+            };
+            let commit = amend_law(
+                &cli.repo,
+                &Amendment {
+                    uuid,
+                    change,
+                    promulgated_date,
+                    effective_dates,
+                    message,
+                },
+            )?;
+            println!("Amendment committed: {commit}");
         }
         Commands::Validate => {
             let laws = validate_repository(&cli.repo)?;
