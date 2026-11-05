@@ -444,6 +444,8 @@ mod tests {
 
         let xml = fs::read_to_string(&created.path).unwrap();
         assert!(xml.contains("Test &amp; Sample Act"));
+        assert!(xml.contains("<promulgated-date>2026-01-15</promulgated-date>"));
+        assert!(xml.contains("<effective-date>2026-04-01</effective-date>"));
 
         let validated = validate_repository(&repo).unwrap();
         assert_eq!(validated.len(), 1);
