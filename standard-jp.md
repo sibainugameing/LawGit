@@ -1,5 +1,5 @@
 # lawgit 法令データ管理規格
-**Version 1.0 — Draft**
+**Version 1.1 — Draft**
 
 ## 1. 目的
 
@@ -90,6 +90,8 @@ e-Gov 法令検索で使用される法令 ID を保存する。
         <name>法令名</name>
         <law-number>法令番号</law-number>
         <type>法律</type>
+        <promulgated-date>2026-01-15</promulgated-date>
+        <effective-date>2026-04-01</effective-date>
     </metadata>
 
     <body>
@@ -128,6 +130,8 @@ e-Gov 法令検索で使用される法令 ID を保存する。
 | `name` | 必須 | 法令名 |
 | `law-number` | 任意 | 法令番号 |
 | `type` | 必須 | 法令の種類 |
+| `promulgated-date` | 任意 | 当該法令自体の公布日（YYYY-MM-DD） |
+| `effective-date` | 任意 | 当該法令自体の施行日（YYYY-MM-DD） |
 
 `type` の例：
 
@@ -182,6 +186,21 @@ repository/
 | Tag | 特定時点の状態の識別 |
 
 法令の UUID は Git commit hash と独立して管理する。
+
+### 7.1 改正コミットの日付
+
+改正を適用するコミットでは、改正法の公布日を Git の author date と committer date の両方に設定する。時刻は日本標準時の 00:00 とする。
+
+改正の施行日はコミットメッセージの trailer に記録する。
+
+```text
+道路交通法の一部を改正する法律
+
+LawGit-Amendment-Promulgated-Date: 2026-11-05
+LawGit-Effective-Date: 2026-12-01
+```
+
+施行日が複数ある場合は `LawGit-Effective-Date` を日付ごとに複数記録する。これにより、法令本文の版と、改正法の公布日・施行日を区別する。
 
 ## 8. データ整合性
 
