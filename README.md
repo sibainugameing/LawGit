@@ -127,7 +127,7 @@ Supply `--effective-date` more than once when an amendment has multiple commence
 
 This CLI interface is the integration boundary for external applications; an application can launch the process and communicate through files or standard input. No network API server is required.
 
-Use one commit for one amendment. When one amending act changes multiple legal documents, stage all affected XML files in the same commit. Record the amending act and the change summary in the commit message.
+Use one commit for one amendment. The current `lawgit amend` command applies one target UUID per invocation. When one amending act changes multiple legal documents, update all affected XML files and create one Git commit containing all of them manually; batch application across multiple UUIDs is not implemented yet. Record the amending act and the change summary in the commit message.
 
 Use branches for proposed amendments and merge them when the proposal is adopted. Use Git tags when a named repository state must be retained.
 
