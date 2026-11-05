@@ -1,4 +1,6 @@
 pub mod rules;
+pub mod amendments;
+pub use amendments::{amend_law, Amendment, AmendmentChange};
 pub use rules::{create_rule, list_rules, prompt_and_create_rule, read_rule, validate_rule_repository, NewRule, RuleSummary};
 
 use anyhow::{bail, Context, Result};
@@ -16,6 +18,8 @@ pub struct NewLaw {
     pub law_type: String,
     pub law_number: Option<String>,
     pub e_gov_id: Option<String>,
+    pub promulgated_date: Option<String>,
+    pub effective_date: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -78,6 +82,15 @@ pub fn create_law(repo: &Path, input: &NewLaw) -> Result<LawSummary> {
 
     let law_number = normalize_optional(input.law_number.as_deref());
     let e_gov_id = normalize_optional(input.e_gov_id.as_deref());
+    let promulgated_date = normalize_optional(input.promulgated_date.as_deref());
+    let effective_date = normalize_optional(input.effective_date.as_deref());
+
+    if let Some(value) = &promulgated_date {
+        validate_iso_date(value, "promulgated-date")?;
+    }
+    if let Some(value) = &effective_date {
+        validate_iso_date(value, "effective-date")?;
+    }
 
     if let Some(value) = &law_number {
         validate_xml_text(value, "law-number")?;
@@ -102,7 +115,7 @@ pub fn create_law(repo: &Path, input: &NewLaw) -> Result<LawSummary> {
         .map(|value| format!("        <e-gov-id>{}</e-gov-id>\n", escape_xml(value)))
         .unwrap_or_default();
 
-    let xml = format!(
+    let mut xml = format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
 <law>\n\
     <identifiers>\n\
@@ -124,6 +137,19 @@ pub fn create_law(repo: &Path, input: &NewLaw) -> Result<LawSummary> {
         law_number_xml,
         escape_xml(law_type),
     );
+
+    if let Some(value) = &promulgated_date {
+        xml = xml.replace(
+            "    </metadata>",
+            &format!("        <promulgated-date>{}</promulgated-date>\n    </metadata>", escape_xml(value)),
+        );
+    }
+    if let Some(value) = &effective_date {
+        xml = xml.replace(
+            "    </metadata>",
+            &format!("        <effective-date>{}</effective-date>\n    </metadata>", escape_xml(value)),
+        );
+    }
 
     let mut file = OpenOptions::new()
         .write(true)
@@ -220,6 +246,28 @@ fn validate_xml_text(value: &str, field: &str) -> Result<()> {
         if !valid {
             bail!("{field} contains a character forbidden by XML 1.0");
         }
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_iso_date(value: &str, field: &str) -> Result<()> {
+    let parts: Vec<&str> = value.split('-').collect();
+    if parts.len() != 3 || parts[0].len() != 4 || parts[1].len() != 2 || parts[2].len() != 2 {
+        bail!("{field} must use YYYY-MM-DD format: {value}");
+    }
+    let year: u32 = parts[0].parse().with_context(|| format!("invalid {field}: {value}"))?;
+    let month: u32 = parts[1].parse().with_context(|| format!("invalid {field}: {value}"))?;
+    let day: u32 = parts[2].parse().with_context(|| format!("invalid {field}: {value}"))?;
+    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let days_in_month = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if leap => 29,
+        2 => 28,
+        _ => 0,
+    };
+    if year == 0 || day == 0 || day > days_in_month {
+        bail!("invalid {field} calendar date: {value}");
     }
     Ok(())
 }
@@ -334,6 +382,12 @@ fn parse_law_file(path: &Path) -> Result<LawSummary> {
     let law_type = required_text(metadata, "type")?;
     let law_number = optional_text(metadata, "law-number")?;
     let e_gov_id = optional_text(identifiers, "e-gov-id")?;
+    if let Some(value) = optional_text(metadata, "promulgated-date")? {
+        validate_iso_date(&value, "promulgated-date")?;
+    }
+    if let Some(value) = optional_text(metadata, "effective-date")? {
+        validate_iso_date(&value, "effective-date")?;
+    }
 
     if e_gov_id.as_deref().is_some_and(str::is_empty) {
         bail!("e-Gov Legal ID must not be empty when present: {}", path.display());
@@ -380,6 +434,8 @@ mod tests {
             law_type: "法律".to_owned(),
             law_number: Some("令和八年法律第一号".to_owned()),
             e_gov_id: Some("415AC0000000057".to_owned()),
+            promulgated_date: Some("2026-01-15".to_owned()),
+            effective_date: Some("2026-04-01".to_owned()),
         };
 
         let created = create_law(&repo, &input).unwrap();
