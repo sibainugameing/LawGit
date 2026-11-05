@@ -2,7 +2,10 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
-use lawgit::{create_law, init_repository, list_laws, read_law, validate_repository, NewLaw};
+use lawgit::{
+    create_law, init_repository, list_laws, list_rules, prompt_and_create_rule, read_law,
+    read_rule, validate_repository, validate_rule_repository, NewLaw,
+};
 
 #[derive(Parser)]
 #[command(
@@ -54,6 +57,30 @@ enum Commands {
         /// lawgit UUID v4.
         uuid: String,
     },
+
+    /// Create and manage user-authored rule documents.
+    Rule {
+        #[command(subcommand)]
+        command: RuleCommands,
+    },
+}
+
+#[derive(Subcommand)]
+enum RuleCommands {
+    /// Interactively create a rule document.
+    Make,
+
+    /// List all registered rule documents.
+    List,
+
+    /// Print a rule document by UUID.
+    Show {
+        /// Rule UUID v4.
+        uuid: String,
+    },
+
+    /// Validate every XML document in the rules directory.
+    Validate,
 }
 
 fn main() {
@@ -111,6 +138,33 @@ fn run() -> Result<()> {
             let (_law, xml) = read_law(&cli.repo, &uuid)?;
             print!("{xml}");
         }
+        Commands::Rule { command } => match command {
+            RuleCommands::Make => {
+                let rule = prompt_and_create_rule(&cli.repo)?;
+                println!("Created rule: {}", rule.name);
+                println!("UUID:         {}", rule.uuid);
+                println!("File:         {}", rule.path.display());
+            }
+            RuleCommands::List => {
+                let rules = list_rules(&cli.repo)?;
+                if rules.is_empty() {
+                    println!("No rule documents are registered.");
+                } else {
+                    println!("{:<36}  {:<12}  NAME", "UUID", "TYPE");
+                    for rule in rules {
+                        println!("{:<36}  {:<12}  {}", rule.uuid, rule.rule_type, rule.name);
+                    }
+                }
+            }
+            RuleCommands::Show { uuid } => {
+                let (_rule, xml) = read_rule(&cli.repo, &uuid)?;
+                print!("{xml}");
+            }
+            RuleCommands::Validate => {
+                let rules = validate_rule_repository(&cli.repo)?;
+                println!("Validation passed: {} rule document(s).", rules.len());
+            }
+        },
     }
 
     Ok(())
