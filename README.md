@@ -110,7 +110,9 @@ lawgit rule show <UUID>
 lawgit rule validate
 ~~~
 
-The XML file path is shown after creation and in the list output. Edit that file with a text editor. Use Git to review and record changes:
+The XML file path is shown after creation and in the list output. **Creating a rule automatically creates a Git commit** (message: `Create rule: <name>`). The commit includes only the new rule file, not unrelated staged changes.
+
+Edit an existing rule with a text editor. Review and commit changes manually:
 
 ~~~sh
 git diff -- rules/
