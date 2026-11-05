@@ -47,6 +47,7 @@ pub fn amend_law(repo: &Path, amendment: &Amendment) -> Result<String> {
         .with_context(|| format!("cannot load target law {}", amendment.uuid))?;
     let relative_path = PathBuf::from("laws").join(format!("{}.xml", law.uuid));
     let absolute_path = repo.join(&relative_path);
+    ensure_clean_tracked_file(repo, &relative_path)?;
 
     match &amendment.change {
         AmendmentChange::CompleteXml(xml) => {
@@ -141,6 +142,42 @@ pub fn amend_law(repo: &Path, amendment: &Amendment) -> Result<String> {
     }
 
     Ok(String::from_utf8_lossy(&hash_output.stdout).trim().to_owned())
+}
+
+fn ensure_clean_tracked_file(repo: &Path, relative_path: &Path) -> Result<()> {
+    let tracked = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .arg("ls-files")
+        .arg("--error-unmatch")
+        .arg("--")
+        .arg(relative_path)
+        .output()
+        .context("Git is required but could not be executed")?;
+    if !tracked.status.success() {
+        bail!("the target law file must be committed to Git before it can be amended");
+    }
+
+    let status = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .arg("status")
+        .arg("--porcelain")
+        .arg("--untracked-files=all")
+        .arg("--")
+        .arg(relative_path)
+        .output()
+        .context("failed to inspect the target law file's Git status")?;
+    if !status.status.success() {
+        bail!(
+            "git status failed: {}",
+            String::from_utf8_lossy(&status.stderr).trim()
+        );
+    }
+    if !String::from_utf8_lossy(&status.stdout).trim().is_empty() {
+        bail!("the target law file has uncommitted changes; commit or stash them before applying an amendment");
+    }
+    Ok(())
 }
 
 fn run_git_apply(repo: &Path, relative_path: &Path, patch: &str, check: bool) -> Result<()> {
