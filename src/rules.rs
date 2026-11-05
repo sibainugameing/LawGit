@@ -138,6 +138,43 @@ pub fn create_rule(repo: &Path, input: &NewRule) -> Result<RuleSummary> {
         .with_context(|| format!("cannot create rule file: {}", path.display()))?;
     file.write_all(xml.as_bytes())
         .with_context(|| format!("cannot write rule file: {}", path.display()))?;
+    drop(file);
+
+    // Commit only this new rule document, without including unrelated staged changes.
+    let relative_path = Path::new("rules").join(format!("{uuid}.xml"));
+    let add_output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .arg("add")
+        .arg("--")
+        .arg(&relative_path)
+        .output()
+        .context("Git is required but could not be executed")?;
+    if !add_output.status.success() {
+        bail!(
+            "git add failed: {}",
+            String::from_utf8_lossy(&add_output.stderr).trim()
+        );
+    }
+
+    let commit_message = format!("Create rule: {name}");
+    let commit_output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .arg("commit")
+        .arg("--only")
+        .arg("-m")
+        .arg(&commit_message)
+        .arg("--")
+        .arg(&relative_path)
+        .output()
+        .context("Git is required but could not be executed")?;
+    if !commit_output.status.success() {
+        bail!(
+            "rule file was created and staged, but Git commit failed: {}",
+            String::from_utf8_lossy(&commit_output.stderr).trim()
+        );
+    }
 
     parse_rule_file(&path)
 }
