@@ -259,7 +259,8 @@ mod tests {
         );
         fs::write(&law.path, &initial_xml).unwrap();
 
-        git(&repo, &["add", "--", &format!("laws/{}.xml", law.uuid)]);
+        let pathspec = format!("laws/{}.xml", law.uuid);
+        git(&repo, &["add", "--", pathspec.as_str()]);
         git(&repo, &["commit", "-m", "Initial law version"]);
 
         let amended_xml = initial_xml.replace("Before", "After");
@@ -338,7 +339,7 @@ mod unified_diff_tests {
         );
         fs::write(&law.path, &initial_xml).unwrap();
         let relative_path = format!("laws/{}.xml", law.uuid);
-        git(&repo, &["add", "--", &relative_path]);
+        git(&repo, &["add", "--", relative_path.as_str()]);
         git(&repo, &["commit", "-m", "Initial law version"]);
 
         let amended_xml = initial_xml.replace("Before", "After");
@@ -367,7 +368,8 @@ mod unified_diff_tests {
         )
         .unwrap();
 
-        let committed_xml = git(&repo, &["show", &format!("HEAD:{relative_path}")]);
+        let show_spec = format!("HEAD:{relative_path}");
+        let committed_xml = git(&repo, &["show", show_spec.as_str()]);
         assert!(committed_xml.contains("After"));
         assert!(!committed_xml.contains("Before"));
 
