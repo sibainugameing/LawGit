@@ -27,6 +27,8 @@ pub struct RuleSummary {
 /// Enter a single dot (.) on its own line to finish the body.
 /// Enter two dots (..) to insert a literal dot line.
 pub fn prompt_and_create_rule(repo: &Path) -> Result<RuleSummary> {
+    ensure_git_repository(repo)?;
+
     let name = prompt_required("Rule name: ")?;
     let rule_type = prompt_required("Rule type/category: ")?;
 
@@ -122,11 +124,11 @@ pub fn create_rule(repo: &Path, input: &NewRule) -> Result<RuleSummary> {
         <type>{}</type>\n\
     </metadata>\n\
 \n\
-    <body>{}</body>\n\
+    <body><![CDATA[{}]]></body>\n\
 </rule>\n",
         escape_xml(name),
         escape_xml(rule_type),
-        escape_xml(&input.body),
+        escape_cdata(&input.body),
     );
 
     let mut file = OpenOptions::new()
@@ -232,6 +234,10 @@ fn escape_xml(value: &str) -> String {
         .replace('>', "&gt;")
         .replace('"', "&quot;")
         .replace('\'', "&apos;")
+}
+
+fn escape_cdata(value: &str) -> String {
+    value.replace("]]>", "]]]]><![CDATA[>")
 }
 
 fn one_child<'a, 'input>(parent: Node<'a, 'input>, name: &str) -> Result<Node<'a, 'input>> {
@@ -347,7 +353,7 @@ mod tests {
 
         let xml = fs::read_to_string(&created.path).unwrap();
         assert!(xml.contains("Server Rules &amp; Guidelines"));
-        assert!(xml.contains("&lt;safe&gt; values &amp;"));
+        assert!(xml.contains("Use <safe> values & keep records."));
 
         let listed = list_rules(&repo).unwrap();
         assert_eq!(listed.len(), 1);
