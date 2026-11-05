@@ -170,3 +170,88 @@ fn run_git_apply(repo: &Path, relative_path: &Path, patch: &str, check: bool) ->
     }
     Ok(())
 }
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{create_law, init_repository, NewLaw};
+    use std::process::Command;
+    use uuid::Uuid;
+
+    fn git(repo: &Path, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git command failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_owned()
+    }
+
+    #[test]
+    fn complete_xml_amendment_creates_a_dated_commit() {
+        let repo = std::env::temp_dir().join(format!("lawgit-amend-test-{}", Uuid::new_v4()));
+        fs::create_dir_all(&repo).unwrap();
+        init_repository(&repo).unwrap();
+        git(&repo, &["config", "user.name", "LawGit Test"]);
+        git(&repo, &["config", "user.email", "lawgit-test@example.invalid"]);
+
+        let law = create_law(
+            &repo,
+            &NewLaw {
+                name: "Test Act".to_owned(),
+                law_type: "法律".to_owned(),
+                law_number: None,
+                e_gov_id: None,
+                promulgated_date: Some("2026-01-15".to_owned()),
+                effective_date: Some("2026-04-01".to_owned()),
+            },
+        )
+        .unwrap();
+
+        let xml = fs::read_to_string(&law.path).unwrap();
+        let initial_xml = xml.replace(
+            "<body />",
+            "<body><article><text>Before</text></article></body>",
+        );
+        fs::write(&law.path, &initial_xml).unwrap();
+
+        git(&repo, &["add", "--", &format!("laws/{}.xml", law.uuid)]);
+        git(&repo, &["commit", "-m", "Initial law version"]);
+
+        let amended_xml = initial_xml.replace("Before", "After");
+        let commit = amend_law(
+            &repo,
+            &Amendment {
+                uuid: law.uuid.clone(),
+                change: AmendmentChange::CompleteXml(amended_xml),
+                promulgated_date: "2026-11-05".to_owned(),
+                effective_dates: vec!["2026-12-01".to_owned(), "2027-04-01".to_owned()],
+                message: "Test amendment".to_owned(),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(commit, git(&repo, &["rev-parse", "HEAD"]));
+        let author_date = git(&repo, &["log", "-1", "--format=%aI"]);
+        let committer_date = git(&repo, &["log", "-1", "--format=%cI"]);
+        assert!(author_date.starts_with("2026-11-05T00:00:00"));
+        assert!(committer_date.starts_with("2026-11-05T00:00:00"));
+
+        let message = git(&repo, &["log", "-1", "--format=%B"]);
+        assert!(message.contains("LawGit-Amendment-Promulgated-Date: 2026-11-05"));
+        assert!(message.contains("LawGit-Effective-Date: 2026-12-01"));
+        assert!(message.contains("LawGit-Effective-Date: 2027-04-01"));
+
+        let changed_files = git(&repo, &["diff-tree", "--no-commit-id", "--name-only", "-r", "HEAD"]);
+        assert_eq!(changed_files, format!("laws/{}.xml", law.uuid));
+
+        fs::remove_dir_all(repo).unwrap();
+    }
+}
