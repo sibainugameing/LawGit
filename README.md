@@ -75,7 +75,7 @@ git law --repo legal-data show <UUID>
 
 ## Git workflow
 
-Git is the history engine. LawGit does not create a separate amendment-history file and does not commit automatically.
+Git is the history engine. LawGit does not create a separate amendment-history file. Manual XML edits are committed manually; the `amend` command validates and commits an applied amendment automatically.
 
 For manual edits, validate and commit the affected XML file yourself:
 
