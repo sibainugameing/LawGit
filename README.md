@@ -77,7 +77,7 @@ git law --repo legal-data show <UUID>
 
 Git is the history engine. LawGit does not create a separate amendment-history file and does not commit automatically.
 
-After editing the affected XML document files:
+For manual edits, validate and commit the affected XML file yourself:
 
 ~~~sh
 lawgit --repo legal-data validate
@@ -85,6 +85,47 @@ cd legal-data
 git add laws/<UUID>.xml
 git commit -m "道路交通法：改正内容を記述"
 ~~~
+
+For amendments applied through LawGit, use `lawgit amend`. It validates the result and creates a commit automatically. The promulgation date of the amending law is used for both Git timestamps; its commencement date(s) are recorded as commit-message trailers.
+
+### External application integration
+
+An external editor can pass either a complete law XML document or a unified diff to LawGit. LawGit applies the change to the existing UUID file and commits only that file.
+
+Replace the complete XML document:
+
+~~~sh
+lawgit --repo legal-data amend \
+  --uuid <UUID> \
+  --input amended-law.xml \
+  --promulgated-date 2026-11-05 \
+  --effective-date 2026-12-01 \
+  --message "道路交通法の改正"
+~~~
+
+Read a complete XML document from standard input:
+
+~~~sh
+cat amended-law.xml | lawgit --repo legal-data amend \
+  --uuid <UUID> --input - \
+  --promulgated-date 2026-11-05 \
+  --effective-date 2026-12-01 \
+  --message "道路交通法の改正"
+~~~
+
+Apply a unified diff instead:
+
+~~~sh
+cat amendment.patch | lawgit --repo legal-data amend \
+  --uuid <UUID> --patch - \
+  --promulgated-date 2026-11-05 \
+  --effective-date 2026-12-01 \
+  --message "道路交通法の改正"
+~~~
+
+Supply `--effective-date` more than once when an amendment has multiple commencement dates. The date options accept ISO dates in `YYYY-MM-DD` format. The Git author and committer timestamps are set to 00:00 JST on the amendment's promulgation date.
+
+This CLI interface is the integration boundary for external applications; an application can launch the process and communicate through files or standard input. No network API server is required.
 
 Use one commit for one amendment. When one amending act changes multiple legal documents, stage all affected XML files in the same commit. Record the amending act and the change summary in the commit message.
 
@@ -140,11 +181,12 @@ git law rule validate
 | git law validate (or lawgit validate) | Validate XML syntax, required elements, UUID format, filenames, duplicate UUIDs, and body structure |
 | git law list (or lawgit list) | List validated legal documents |
 | git law show <UUID> (or lawgit show <UUID>) | Print a legal document's XML |
+| git law amend (or lawgit amend) | Apply complete XML or a unified diff, validate, and commit the amendment |
 
 The --repo option selects the legal-data repository. It defaults to the current directory.
 
 ## Scope of this initial implementation
 
-This version provides local repository initialization, document registration, XML validation, listing, and reading.
+This version provides local repository initialization, document registration, XML validation, listing, reading, and amendment application from complete XML or unified diff input. Amendment commits record the amending law's promulgation date in Git timestamps and commencement dates in commit-message trailers.
 
 It does not yet import data from e-Gov, determine amendment text automatically, provide a graphical editor, or define a complete vocabulary for article/paragraph/item XML elements. The legal body is preserved as structured XML, while its detailed element vocabulary remains a separate specification task.
