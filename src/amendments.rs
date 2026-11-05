@@ -255,3 +255,85 @@ mod tests {
         fs::remove_dir_all(repo).unwrap();
     }
 }
+
+
+#[cfg(test)]
+mod unified_diff_tests {
+    use super::*;
+    use crate::{create_law, init_repository, NewLaw};
+    use std::process::Command;
+    use uuid::Uuid;
+
+    fn git(repo: &Path, args: &[&str]) -> String {
+        let output = Command::new("git").arg("-C").arg(repo).args(args).output().unwrap();
+        assert!(
+            output.status.success(),
+            "git command failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_owned()
+    }
+
+    #[test]
+    fn unified_diff_amendment_is_applied_to_the_requested_law() {
+        let repo = std::env::temp_dir().join(format!("lawgit-patch-test-{}", Uuid::new_v4()));
+        fs::create_dir_all(&repo).unwrap();
+        init_repository(&repo).unwrap();
+        git(&repo, &["config", "user.name", "LawGit Test"]);
+        git(&repo, &["config", "user.email", "lawgit-test@example.invalid"]);
+
+        let law = create_law(
+            &repo,
+            &NewLaw {
+                name: "Patch Test Act".to_owned(),
+                law_type: "法律".to_owned(),
+                law_number: None,
+                e_gov_id: None,
+                promulgated_date: None,
+                effective_date: None,
+            },
+        )
+        .unwrap();
+        let xml = fs::read_to_string(&law.path).unwrap();
+        let initial_xml = xml.replace(
+            "<body />",
+            "<body><article><text>Before</text></article></body>",
+        );
+        fs::write(&law.path, &initial_xml).unwrap();
+        let relative_path = format!("laws/{}.xml", law.uuid);
+        git(&repo, &["add", "--", &relative_path]);
+        git(&repo, &["commit", "-m", "Initial law version"]);
+
+        let amended_xml = initial_xml.replace("Before", "After");
+        fs::write(&law.path, &amended_xml).unwrap();
+        let diff_output = Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["diff", "--"])
+            .arg(&relative_path)
+            .output()
+            .unwrap();
+        assert!(diff_output.status.success());
+        let patch = String::from_utf8(diff_output.stdout).unwrap();
+        assert!(patch.contains(&relative_path));
+
+        fs::write(&law.path, &initial_xml).unwrap();
+        amend_law(
+            &repo,
+            &Amendment {
+                uuid: law.uuid.clone(),
+                change: AmendmentChange::UnifiedDiff(patch),
+                promulgated_date: "2026-11-06".to_owned(),
+                effective_dates: vec!["2026-12-15".to_owned()],
+                message: "Patch-based amendment".to_owned(),
+            },
+        )
+        .unwrap();
+
+        let committed_xml = git(&repo, &["show", &format!("HEAD:{relative_path}")]);
+        assert!(committed_xml.contains("After"));
+        assert!(!committed_xml.contains("Before"));
+
+        fs::remove_dir_all(repo).unwrap();
+    }
+}
