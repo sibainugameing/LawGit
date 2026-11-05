@@ -10,3 +10,7 @@ anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 roxmltree = "0.20"
 uuid = { version = "1", features = ["v4"] }
+
+[[bin]]
+name = "git-law"
+path = "src/bin/git-law.rs"
