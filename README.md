@@ -100,7 +100,7 @@ Create a rule interactively:
 lawgit rule make
 ~~~
 
-Enter the rule name and category, then enter the body. The body accepts Markdown text. Finish body input by entering a single dot (`.`) on its own line; enter two dots (`..`) to insert a literal dot line.
+Enter the rule name and category, then enter the body. The body accepts Markdown text and is stored in a CDATA section, so ordinary Markdown characters can be edited directly in the XML file. Finish body input by entering a single dot (`.`) on its own line; enter two dots (`..`) to insert a literal dot line.
 
 Manage existing rules:
 
