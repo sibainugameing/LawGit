@@ -1,3 +1,6 @@
+pub mod rules;
+pub use rules::{create_rule, list_rules, prompt_and_create_rule, read_rule, validate_rule_repository, NewRule, RuleSummary};
+
 use anyhow::{bail, Context, Result};
 use roxmltree::{Document, Node};
 use std::collections::HashMap;
@@ -48,6 +51,8 @@ pub fn init_repository(repo: &Path) -> Result<()> {
 
     fs::create_dir_all(repo.join("laws"))
         .with_context(|| format!("cannot create laws directory in {}", repo.display()))?;
+    fs::create_dir_all(repo.join("rules"))
+        .with_context(|| format!("cannot create rules directory in {}", repo.display()))?;
 
     Ok(())
 }
