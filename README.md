@@ -15,11 +15,34 @@ The data format and repository layout are defined by standard-jp.md and standard
 cargo build --release
 ~~~
 
-The executable is created at target/release/lawgit. It can also be installed with:
+The executables are created at target/release/lawgit and target/release/git-law. The latter enables Git's external subcommand syntax (`git law ...`). You can install both with:
 
 ~~~sh
 cargo install --path .
 ~~~
+
+## Git subcommand integration
+
+LawGit supports Git's external subcommand mechanism. Install the package and ensure Cargo's bin directory is in your PATH:
+
+~~~sh
+cargo install --path .
+# Usually ~/.cargo/bin should be in PATH
+~~~
+
+Then use LawGit as a Git subcommand:
+
+~~~sh
+git law init
+git law new --name "道路交通法" --type "法律"
+git law validate
+git law list
+git law show <UUID>
+~~~
+
+Git discovers the executable named `git-law` from PATH. LawGit does not modify or replace the Git executable.
+
+The regular `lawgit` command remains available as well.
 
 ## Quick start
 
@@ -27,13 +50,13 @@ Create a separate repository for the legal documents:
 
 ~~~sh
 mkdir legal-data
-lawgit --repo legal-data init
+git law --repo legal-data init
 ~~~
 
 Register a legal document. LawGit generates a UUID v4 and creates laws/<UUID>.xml:
 
 ~~~sh
-lawgit --repo legal-data new \
+git law --repo legal-data new \
   --name "道路交通法" \
   --type "法律" \
   --law-number "昭和三十五年法律第百五号" \
@@ -45,9 +68,9 @@ Edit the generated XML file to add the legal text. The body must use XML structu
 Validate and inspect the repository:
 
 ~~~sh
-lawgit --repo legal-data validate
-lawgit --repo legal-data list
-lawgit --repo legal-data show <UUID>
+git law --repo legal-data validate
+git law --repo legal-data list
+git law --repo legal-data show <UUID>
 ~~~
 
 ## Git workflow
@@ -71,11 +94,11 @@ Use branches for proposed amendments and merge them when the proposal is adopted
 
 | Command | Purpose |
 |---|---|
-| lawgit init | Initialize a Git-backed law repository and create laws/ |
-| lawgit new | Create a new XML document with a generated UUID v4 |
-| lawgit validate | Validate XML syntax, required elements, UUID format, filenames, duplicate UUIDs, and body structure |
-| lawgit list | List validated legal documents |
-| lawgit show <UUID> | Print a legal document's XML |
+| git law init (or lawgit init) | Initialize a Git-backed law repository and create laws/ |
+| git law new (or lawgit new) | Create a new XML document with a generated UUID v4 |
+| git law validate (or lawgit validate) | Validate XML syntax, required elements, UUID format, filenames, duplicate UUIDs, and body structure |
+| git law list (or lawgit list) | List validated legal documents |
+| git law show <UUID> (or lawgit show <UUID>) | Print a legal document's XML |
 
 The --repo option selects the legal-data repository. It defaults to the current directory.
 
