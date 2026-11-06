@@ -1,192 +1,116 @@
 # LawGit
 
-LawGit is a Rust CLI for managing legal documents as structured XML files in a Git repository.
+法令とユーザー作成ルールを、構造化 XML として Git リポジトリで管理する Rust 製 CLI です。
+LawGit is a Rust CLI that manages legal documents and user-authored rules as structured XML in a Git repository.
 
-The data format and repository layout are defined by standard-jp.md and standard-en.md.
+データ形式とリポジトリ構成は [standard-jp.md](standard-jp.md) / [standard-en.md](standard-en.md) に従います（ルール文書は付録 A）。
+**外部クレート依存なし**（標準ライブラリのみ）なので、Rust と Git があればビルドできます。
 
-## Requirements
+## ビルド / Build
 
-- Rust and Cargo
-- Git
-
-## Build
-
-~~~sh
+```sh
 cargo build --release
-~~~
+cargo test                  # 単体テスト
+sh scripts/smoke.sh         # CLI・RPC・HTTP の通し確認（curl 必要）
+cargo install --path .      # lawgit と git-law を ~/.cargo/bin へ
+```
 
-The executables are created at target/release/lawgit and target/release/git-law. The latter enables Git's external subcommand syntax (`git law ...`). You can install both with:
+`git-law` を PATH に置くと `git law ...` で呼べます（Git の外部サブコマンド機構。Git 本体は変更しません）。
+ヘルプは `git law help`（`git law --help` は Git が man を探しに行くため）。
 
-~~~sh
-cargo install --path .
-~~~
+## クイックスタート
 
-## Git subcommand integration
-
-LawGit supports Git's external subcommand mechanism. Install the package and ensure Cargo's bin directory is in your PATH:
-
-~~~sh
-cargo install --path .
-# Usually ~/.cargo/bin should be in PATH
-~~~
-
-Then use LawGit as a Git subcommand:
-
-~~~sh
-git law init
-git law new --name "道路交通法" --type "法律"
-git law validate
-git law list
-git law show <UUID>
-~~~
-
-Git discovers the executable named `git-law` from PATH. LawGit does not modify or replace the Git executable.
-
-The regular `lawgit` command remains available as well.
-
-## Quick start
-
-Create a separate repository for the legal documents:
-
-~~~sh
+```sh
 mkdir legal-data
 git law --repo legal-data init
-~~~
 
-Register a legal document. LawGit generates a UUID v4 and creates laws/<UUID>.xml:
-
-~~~sh
-git law --repo legal-data new \
-  --name "道路交通法" \
-  --type "法律" \
-  --law-number "昭和三十五年法律第百五号" \
-  --e-gov-id "335AC0000000105"
-~~~
-
-Edit the generated XML file to add the legal text. The body must use XML structural elements; it must not be stored as one plain-text value.
-
-Validate and inspect the repository:
-
-~~~sh
+# 法令: UUID v4 を採番し laws/<UUID>.xml を作成
+git law --repo legal-data new --name "道路交通法" --type "法律" \
+  --law-number "昭和三十五年法律第百五号" --e-gov-id "335AC0000000105"
+# → XML の <body> に条・項・号を XML 要素で記述（単一文字列は不可）
 git law --repo legal-data validate
 git law --repo legal-data list
 git law --repo legal-data show <UUID>
-~~~
+```
 
-## Git workflow
+## ルールの作成・管理
 
-Git is the history engine. LawGit does not create a separate amendment-history file. Manual XML edits are committed manually; the `amend` command validates and commits an applied amendment automatically.
+ルールは `rules/<UUID>.xml`（ルート `rule`）に保存され、法令とは別スキーマ・別検証です。UUID は不変です。
 
-For manual edits, validate and commit the affected XML file yourself:
+```sh
+lawgit rule make                      # 対話: 名前 → カテゴリ → 本文(Markdown)。単独の . で終了、.. でリテラルの .
+lawgit rule new --name "休暇規則" --category 人事 --body-file vacation.md   # 非対話
+lawgit rule list [--category 人事] [--query 休暇]
+lawgit rule show <UUID>
+lawgit rule set <UUID> --name "新名称" --body-file new.md   # 名前/カテゴリ/本文を更新（UUID・作成日時は保持）
+lawgit rule edit <UUID>               # $VISUAL / $EDITOR で編集 → 保存後に自動検証
+lawgit rule path <UUID>
+lawgit rule delete <UUID> --yes
+lawgit rule validate
+lawgit check                          # laws/ と rules/ をまとめて検証（UUID 重複も検出）
+```
 
-~~~sh
+## Git ワークフロー
+
+Git が履歴エンジンです。LawGit は独自の履歴ファイルを作らず、**自動 commit もしません**。
+
+```sh
 lawgit --repo legal-data validate
 cd legal-data
 git add laws/<UUID>.xml
 git commit -m "道路交通法：改正内容を記述"
-~~~
+```
 
-For amendments applied through LawGit, use `lawgit amend`. It validates the result and creates a commit automatically. The promulgation date of the amending law is used for both Git timestamps; its commencement date(s) are recorded as commit-message trailers.
+1 改正 = 1 commit。1 つの改正法が複数の法令を変更する場合は、影響する全 XML を同じ commit に含め、改正法と変更概要を commit メッセージに記録します。
+改正案は branch、採択は merge、名前を付けたい状態は tag を使います。
 
-### External application integration
+便利コマンド: `lawgit commit -m "メッセージ"`（全体を検証し、通った場合のみ `laws/` と `rules/` を add して commit）。
 
-An external editor can pass either a complete law XML document or a unified diff to LawGit. LawGit applies the change to the existing UUID file and commits only that file.
+## 他アプリとの連携窓口 / Integration
 
-Replace the complete XML document:
-
-~~~sh
-lawgit --repo legal-data amend \
-  --uuid <UUID> \
-  --input amended-law.xml \
-  --promulgated-date 2026-11-05 \
-  --effective-date 2026-12-01 \
-  --message "道路交通法の改正"
-~~~
-
-Read a complete XML document from standard input:
-
-~~~sh
-cat amended-law.xml | lawgit --repo legal-data amend \
-  --uuid <UUID> --input - \
-  --promulgated-date 2026-11-05 \
-  --effective-date 2026-12-01 \
-  --message "道路交通法の改正"
-~~~
-
-Apply a unified diff instead:
-
-~~~sh
-cat amendment.patch | lawgit --repo legal-data amend \
-  --uuid <UUID> --patch - \
-  --promulgated-date 2026-11-05 \
-  --effective-date 2026-12-01 \
-  --message "道路交通法の改正"
-~~~
-
-Supply `--effective-date` more than once when an amendment has multiple commencement dates. The date options accept ISO dates in `YYYY-MM-DD` format. The Git author and committer timestamps are set to 00:00 JST on the amendment's promulgation date.
-
-This CLI interface is the integration boundary for external applications; an application can launch the process and communicate through files or standard input. No network API server is required.
-
-Use one commit for one amendment. The current `lawgit amend` command applies one target UUID per invocation. When one amending act changes multiple legal documents, update all affected XML files and create one Git commit containing all of them manually; batch application across multiple UUIDs is not implemented yet. Record the amending act and the change summary in the commit message.
-
-Use branches for proposed amendments and merge them when the proposal is adopted. Use Git tags when a named repository state must be retained.
-
-## User-authored rule documents
-
-LawGit can manage user-authored rules and policy documents separately from legal documents. Rule documents are stored in `rules/<UUID>.xml`; they do not use the legal-document schema in `laws/`.
-
-Create a rule interactively:
-
-~~~sh
-lawgit rule make
-~~~
-
-Enter the rule name and category, then enter the body. The body accepts Markdown text and is stored in a CDATA section, so ordinary Markdown characters can be edited directly in the XML file. Finish body input by entering a single dot (`.`) on its own line; enter two dots (`..`) to insert a literal dot line.
-
-Manage existing rules:
-
-~~~sh
-lawgit rule list
-lawgit rule show <UUID>
-lawgit rule validate
-~~~
-
-The XML file path is shown after creation and in the list output. **Creating a rule automatically creates a Git commit** (message: `Create rule: <name>`). The commit includes only the new rule file, not unrelated staged changes.
-
-Edit an existing rule with a text editor. Review and commit changes manually:
-
-~~~sh
-git diff -- rules/
-git add rules/<UUID>.xml
-git commit -m "Update rule: <rule name>"
-~~~
-
-Each rule receives an immutable UUID v4. Its name and category are metadata, not identifiers. Rule documents have their own XML root (`rule`) and validation; they are kept separate from legal documents.
-
-The same commands are available through the Git subcommand:
-
-~~~sh
-git law rule make
-git law rule list
-git law rule show <UUID>
-git law rule validate
-~~~
-
-## Current commands
-
-| Command | Purpose |
+| 窓口 | コマンド |
 |---|---|
-| git law init (or lawgit init) | Initialize a Git-backed law repository and create laws/ |
-| git law new (or lawgit new) | Create a new XML document with a generated UUID v4 |
-| git law validate (or lawgit validate) | Validate XML syntax, required elements, UUID format, filenames, duplicate UUIDs, and body structure |
-| git law list (or lawgit list) | List validated legal documents |
-| git law show <UUID> (or lawgit show <UUID>) | Print a legal document's XML |
-| git law amend (or lawgit amend) | Apply complete XML or a unified diff, validate, and commit the amendment |
+| JSON 出力 | `lawgit list --json`, `show --json`, `validate --json`, `check --json`, `rule list --json` … |
+| stdio JSON-lines | `lawgit --repo DIR rpc` |
+| ローカル HTTP API | `lawgit --repo DIR serve [--host 127.0.0.1] [--port 8787] [--token T]` → `/api/v1/...` |
 
-The --repo option selects the legal-data repository. It defaults to the current directory.
+メソッド一覧・リクエスト例・安全設計は [docs/API.md](docs/API.md) を参照。
 
-## Scope of this initial implementation
+## e-Gov からのインポート（独立した Python スクリプト）
 
-This version provides local repository initialization, document registration, XML validation, listing, reading, and amendment application from complete XML or unified diff input. Amendment commits record the amending law's promulgation date in Git timestamps and commencement dates in commit-message trailers.
+ネットワーク通信を伴う処理は危険なため、**Rust 製の lawgit 本体には一切含めていません**。
+取り込みは `tools/egov_import.py`（Python 3.9+、標準ライブラリのみ）が単独で行い、書き込み先は `laws/<UUID>.xml` だけです。
 
-It does not yet import data from e-Gov, determine amendment text automatically, provide a graphical editor, or define a complete vocabulary for article/paragraph/item XML elements. The legal body is preserved as structured XML, while its detailed element vocabulary remains a separate specification task.
+```sh
+python3 tools/egov_import.py --repo legal-data 415AC0000000057            # dry-run（既定。何も書かない）
+python3 tools/egov_import.py --repo legal-data 415AC0000000057 --write    # 書き込み
+python3 tools/egov_import.py --repo legal-data --from-file law.xml --law-id 415AC0000000057 --write  # 通信なし
+python3 tools/egov_import.py --repo legal-data 335AC0000000105 --asof 2025-04-01 --write --update
+lawgit --repo legal-data validate && cd legal-data && git diff   # 確認してから自分で commit
+```
+
+- 通信先は `https://laws.e-gov.go.jp/api/2/law_file/xml/{法令ID}` のみ（他ホストへのリダイレクトは拒否、サイズ上限・タイムアウトあり）。
+- DOCTYPE / ENTITY を含む XML は解析前に拒否。取得データは実行・評価しない。
+- 既に取り込み済みの法令は `--update` を付けない限り上書きしない。UUID は既存のものを保持（不変）。自動 commit はしない。
+- 変換: `LawNum`→`law-number`、`LawType`→`type`（Act→法律 など）、`LawTitle`→`name`、`LawBody` 配下→`<body>`（e-Gov の要素語彙のまま構造保持）。
+- テスト: `python3 tools/test_egov_import.py`（オフライン）。
+- 注意: e-Gov API への実通信は、この開発環境では確認できていません。初回は dry-run、または `--from-file` で試してください。
+
+## コマンド一覧
+
+| コマンド | 目的 |
+|---|---|
+| `init` | laws/ rules/ を作成し git init |
+| `new` | 法令 XML を UUID v4 付きで作成 |
+| `validate` | laws/ の検証（構文・必須要素・UUID 形式・ファイル名一致・重複・本文構造・LF） |
+| `list` / `show <UUID>` | 一覧 / XML 表示 |
+| `check` | laws/ + rules/ の総合検証 |
+| `rule make/new/list/show/set/edit/path/delete/validate` | ルール管理 |
+| `commit -m` | 検証付き commit |
+| `serve` / `rpc` | 連携窓口 |
+
+`--repo` で対象リポジトリを指定（既定はカレントディレクトリ）。終了コード: 0 成功 / 1 検証エラー / 2 使用方法・実行エラー。
+
+## 今回のスコープ外
+
+改正文の自動解析、GUI エディタ、条・項・号の要素語彙の完全な定義（本文は構造化 XML として保持するが語彙は別途仕様化）。

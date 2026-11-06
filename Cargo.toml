@@ -2,15 +2,23 @@
 name = "lawgit"
 version = "0.1.0"
 edition = "2021"
-description = "A Git-based legal document management CLI"
-license = "Apache-2.0"
+rust-version = "1.70"
+description = "Manage legal documents and user-authored rules as structured XML in a Git repository"
+license = "MIT"
 
-[dependencies]
-anyhow = "1"
-clap = { version = "4", features = ["derive"] }
-roxmltree = "0.20"
-uuid = { version = "1", features = ["v4"] }
+[lib]
+name = "lawgit_core"
+path = "src/lib.rs"
+
+[[bin]]
+name = "lawgit"
+path = "src/main.rs"
 
 [[bin]]
 name = "git-law"
 path = "src/bin/git-law.rs"
+
+[dependencies]
+
+[profile.release]
+opt-level = 3
