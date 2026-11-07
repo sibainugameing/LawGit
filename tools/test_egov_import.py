@@ -231,5 +231,32 @@ class HistoryTests(unittest.TestCase):
         self.assertIsNone(E._clean_record("L1", {"law_revision_id": "OTHER_20200401_X"}))
         self.assertIsNone(E._clean_record("L1", {"law_revision_id": "L1_20200401_../x"}))
 
+import os, stat
+
+class VerifyTests(unittest.TestCase):
+    def fake_bin(self, code):
+        p = Path(tempfile.mkdtemp()) / "fake-lawgit"
+        p.write_text(f"#!/bin/sh\necho checked \"$@\"\nexit {code}\n")
+        p.chmod(p.stat().st_mode | stat.S_IEXEC)
+        return str(p)
+
+    def run_verify(self, code):
+        d = Path(tempfile.mkdtemp()); (d / "laws").mkdir()
+        f = d / "src.xml"; f.write_text(SAMPLE, encoding="utf-8")
+        return E.main(["--repo", str(d), "--from-file", str(f), "--law-id", "X1", "--write",
+                       "--verify", "--lawgit-bin", self.fake_bin(code)])
+
+    def test_verify_pass(self):
+        self.assertEqual(self.run_verify(0), 0)
+
+    def test_verify_fail_sets_exit_code(self):
+        self.assertEqual(self.run_verify(1), 1)
+
+    def test_verify_missing_binary(self):
+        d = Path(tempfile.mkdtemp()); (d / "laws").mkdir()
+        f = d / "src.xml"; f.write_text(SAMPLE, encoding="utf-8")
+        self.assertEqual(E.main(["--repo", str(d), "--from-file", str(f), "--law-id", "X1", "--write",
+                                 "--verify", "--lawgit-bin", "/nonexistent/lawgit"]), 1)
+
 if __name__ == "__main__":
     unittest.main()

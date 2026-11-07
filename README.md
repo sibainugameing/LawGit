@@ -10,13 +10,21 @@ LawGit is a Rust CLI that manages legal documents and user-authored rules as str
 
 ```sh
 cargo build --release
-cargo test                  # 単体テスト
+cargo test                  # 単体テスト + tests/cli.rs（実バイナリで CLI・rpc・HTTP・commit を通しで検証）
 sh scripts/smoke.sh         # CLI・RPC・HTTP の通し確認（curl 必要）
 cargo install --path .      # lawgit と git-law を ~/.cargo/bin へ
 ```
 
 `git-law` を PATH に置くと `git law ...` で呼べます（Git の外部サブコマンド機構。Git 本体は変更しません）。
 ヘルプは `git law help`（`git law --help` は Git が man を探しに行くため）。
+
+## 検証状況（正直な申告）
+
+- **Python 側（`tools/`）**: 23 件のオフラインテストを実行し、すべて通過済み（実 Git での履歴復元を含む）。
+- **Rust 側（`src/`, `tests/`）**: 開発環境に Rust ツールチェーンが無く、**コンパイル・テスト実行は未実施**です。全ソースの机上レビューと括弧対応の機械検査のみ行っています。
+  最初に `cargo build --release && cargo test && sh scripts/smoke.sh` を実行してください。`.github/workflows/ci.yml` を GitHub に push すると、同じ検証が自動で走ります。
+  エラーが出た場合は、エラー全文を共有してください。
+- **e-Gov API への実通信**は未確認です（`tools/egov_import.py` は dry-run・`--from-file` で安全に試せます）。
 
 ## クイックスタート
 
@@ -125,6 +133,7 @@ python3 tools/egov_import.py --repo legal-data --all --history --write --yes    
 - 注意: 中断後に再実行すると、取得に失敗して後回しになった版は、より新しい commit の後ろに追加されます（日付は施行日のまま）。
 - 注意: 履歴データの範囲は e-Gov の収録範囲に依存します（v2 は平成 29 年 4 月 1 日以降のデータに対応）。
 
+- 相互検証: `--write --verify`（`--lawgit-bin PATH`）を付けると、書き込み後に Rust 側の `lawgit check` で全ファイルを再検証します（`--history` 併用可）。
 - テスト: `python3 tools/test_egov_import.py`（オフライン）。
 - 注意: e-Gov API への実通信は、この開発環境では確認できていません。初回は dry-run、または `--from-file` で試してください。
 

@@ -624,7 +624,27 @@ def run_history(args, repo: Path, law_ids: list, known: dict) -> int:
     return 1 if failures else 0
 
 
-def main(argv: list[str]) -> int:
+def verify_with_lawgit(repo: Path, binary: str) -> bool:
+    """Cross-check the written files with the Rust validator (`lawgit check`)."""
+    try:
+        r = subprocess.run([binary, "--repo", str(repo), "check"], capture_output=True,
+                           text=True, encoding="utf-8", check=False)
+    except OSError as e:
+        print(f"verify: cannot run {binary!r}: {e}", file=sys.stderr)
+        return False
+    out = (r.stdout or "").strip()
+    if r.returncode == 0:
+        print(f"verify: {out or 'OK'}")
+        return True
+    print(f"verify: lawgit check FAILED (exit {r.returncode})", file=sys.stderr)
+    if out:
+        print(out, file=sys.stderr)
+    if r.stderr.strip():
+        print(r.stderr.strip(), file=sys.stderr)
+    return False
+
+
+def _main_impl(argv: list[str]) -> int:
     ap = argparse.ArgumentParser(description="Import e-Gov laws into a lawgit repository (separate from the Rust CLI).")
     ap.add_argument("law_ids", nargs="*", help="e-Gov law IDs, e.g. 415AC0000000057")
     ap.add_argument("--repo", default=".", help="lawgit repository (must contain laws/)")
@@ -641,6 +661,9 @@ def main(argv: list[str]) -> int:
                     help="restore past amendments as Git commits (oldest first; one commit per amending act)")
     ap.add_argument("--include-unenforced", action="store_true", help="with --history: also restore not-yet-in-force revisions")
     ap.add_argument("--refresh", action="store_true", help="with --history: ignore the cached revision lists")
+    ap.add_argument("--verify", action="store_true",
+                    help="after --write, run `lawgit check` on the repository (cross-validation with the Rust validator)")
+    ap.add_argument("--lawgit-bin", default="lawgit", help="lawgit executable used by --verify (default: lawgit)")
     ap.add_argument("--write", action="store_true", help="actually write files (default: dry-run)")
     ap.add_argument("--update", action="store_true", help="overwrite laws that are already imported")
     args = ap.parse_args(argv)
@@ -741,6 +764,19 @@ def main(argv: list[str]) -> int:
     else:
         print("(dry-run: nothing was written; add --write to apply)")
     return 1 if failures else 0
+
+
+def main(argv: list[str]) -> int:
+    code = _main_impl(argv)
+    if "--verify" in argv and "--write" in argv and code in (0, 1):
+        try:
+            repo_arg = argv[argv.index("--repo") + 1] if "--repo" in argv else "."
+            bin_arg = argv[argv.index("--lawgit-bin") + 1] if "--lawgit-bin" in argv else "lawgit"
+        except IndexError:
+            return code
+        if not verify_with_lawgit(Path(repo_arg), bin_arg):
+            return 1
+    return code
 
 
 if __name__ == "__main__":
