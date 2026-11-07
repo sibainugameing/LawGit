@@ -18,6 +18,8 @@ Rust 製の lawgit 本体にはネットワーク機能がありません。外�
   python3 tools/egov_import.py --repo legal-data 415AC0000000057 --write
   python3 tools/egov_import.py --repo legal-data --from-file law.xml --write # オフライン
   python3 tools/egov_import.py --repo legal-data 335AC0000000105 --asof 2025-04-01 --write --update
+  python3 tools/egov_import.py --repo legal-data --all --max 5 --write --yes     # 全法令 (まず少数で試す)
+  python3 tools/egov_import.py --repo legal-data 415AC0000000057 --history --write  # 改正履歴を Git に復元
 
 本文 (<body>) は e-Gov 法令 XML の LawBody 配下をそのまま構造要素として保持します
 (要素語彙は e-Gov のもの。lawgit 側の語彙定義は別途仕様化の課題)。
@@ -25,8 +27,11 @@ Rust 製の lawgit 本体にはネットワーク機能がありません。外�
 from __future__ import annotations
 
 import argparse
+import datetime
+import json
 import os
 import re
+import subprocess
 import sys
 import time
 import urllib.error
@@ -41,7 +46,15 @@ API_BASE = "https://laws.e-gov.go.jp/api/2"
 ALLOWED_HOST = "laws.e-gov.go.jp"
 MAX_BYTES = 64 * 1024 * 1024
 TIMEOUT = 60
+LIST_PAGE_SIZE = 100
+MAX_LIST_PAGES = 500
+MAX_CONSECUTIVE_FAILURES = 10
+MIN_DELAY = 0.5
+RETRIES = 3
+JST = datetime.timezone(datetime.timedelta(hours=9))
+HISTORY_AUTHOR = ("e-Gov Import", "egov-import@lawgit.invalid")
 LAW_ID_RE = re.compile(r"^[0-9A-Za-z]{1,32}$")
+REVISION_ID_RE = re.compile(r"^[0-9A-Za-z]{1,32}_\d{8}_[0-9A-Za-z]{1,32}$")
 UUID_V4_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$")
 ASOF_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
@@ -69,26 +82,68 @@ class _SameHostRedirect(urllib.request.HTTPRedirectHandler):
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
+def _get(url: str, accept: str) -> bytes:
+    p = urllib.parse.urlparse(url)
+    if p.scheme != "https" or p.hostname != ALLOWED_HOST:
+        raise ImportError_(f"refusing to contact {url}")
+    opener = urllib.request.build_opener(_SameHostRedirect())
+    req = urllib.request.Request(url, headers={"User-Agent": "lawgit-egov-import/0.2", "Accept": accept})
+    try:
+        with opener.open(req, timeout=TIMEOUT) as resp:
+            data = resp.read(MAX_BYTES + 1)
+    except urllib.error.HTTPError as e:
+        raise ImportError_(f"e-Gov returned HTTP {e.code} for {p.path}")
+    except (urllib.error.URLError, TimeoutError, OSError) as e:
+        raise ImportError_(f"network error for {p.path}: {e}")
+    if len(data) > MAX_BYTES:
+        raise ImportError_(f"response for {p.path} exceeds {MAX_BYTES} bytes")
+    return data
+
+
 def fetch_law_xml(law_id: str, asof: str | None) -> bytes:
-    if not LAW_ID_RE.match(law_id):
-        raise ImportError_(f"invalid law id: {law_id!r}")
+    if not (LAW_ID_RE.match(law_id) or REVISION_ID_RE.match(law_id)):
+        raise ImportError_(f"invalid law id / revision id: {law_id!r}")
     url = f"{API_BASE}/law_file/xml/{urllib.parse.quote(law_id)}"
     if asof:
         if not ASOF_RE.match(asof):
             raise ImportError_("--asof must be YYYY-MM-DD")
         url += "?" + urllib.parse.urlencode({"asof": asof})
-    opener = urllib.request.build_opener(_SameHostRedirect())
-    req = urllib.request.Request(url, headers={"User-Agent": "lawgit-egov-import/0.1", "Accept": "application/xml"})
-    try:
-        with opener.open(req, timeout=TIMEOUT) as resp:
-            data = resp.read(MAX_BYTES + 1)
-    except urllib.error.HTTPError as e:
-        raise ImportError_(f"e-Gov returned HTTP {e.code} for {law_id}")
-    except (urllib.error.URLError, TimeoutError, OSError) as e:
-        raise ImportError_(f"network error for {law_id}: {e}")
-    if len(data) > MAX_BYTES:
-        raise ImportError_(f"response for {law_id} exceeds {MAX_BYTES} bytes")
-    return data
+    return _get(url, "application/xml")
+
+
+def list_all_law_ids(asof: str | None = None, max_items: int | None = None, delay: float = 1.0) -> list[str]:
+    """Page through GET /laws and collect every law ID (validated, de-duplicated)."""
+    if asof and not ASOF_RE.match(asof):
+        raise ImportError_("--asof must be YYYY-MM-DD")
+    ids: list[str] = []
+    seen: set[str] = set()
+    offset = 0
+    for page in range(MAX_LIST_PAGES):
+        q = {"limit": LIST_PAGE_SIZE, "offset": offset, "response_format": "json"}
+        if asof:
+            q["asof"] = asof
+        raw = _get(f"{API_BASE}/laws?" + urllib.parse.urlencode(q), "application/json")
+        try:
+            data = json.loads(raw.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError) as e:
+            raise ImportError_(f"law list is not valid JSON: {e}")
+        laws = data.get("laws") if isinstance(data, dict) else None
+        if not isinstance(laws, list) or not laws:
+            break
+        for item in laws:
+            info = item.get("law_info") if isinstance(item, dict) else None
+            lid = info.get("law_id") if isinstance(info, dict) else None
+            if isinstance(lid, str) and LAW_ID_RE.match(lid) and lid not in seen:
+                seen.add(lid)
+                ids.append(lid)
+        if max_items is not None and len(ids) >= max_items:
+            break
+        nxt = data.get("next_offset")
+        if not isinstance(nxt, int) or nxt <= offset:
+            break
+        offset = nxt
+        time.sleep(delay)
+    return ids[:max_items] if max_items is not None else ids
 
 
 # ---------------------------------------------------------------- parsing
@@ -270,13 +325,322 @@ def import_one(repo: Path, egov_id: str, data: bytes, write: bool, update: bool,
     return f"{action.upper():7} {egov_id} {name} -> laws/{uuid_s}.xml"
 
 
+# ---------------------------------------------------------------- amendment history -> Git
+def clean_text(v, limit: int = 200) -> str:
+    if not isinstance(v, str):
+        return ""
+    return re.sub(r"[\x00-\x1f\x7f]+", " ", v).strip()[:limit]
+
+
+def norm_date(v) -> str:
+    if isinstance(v, str) and ASOF_RE.match(v):
+        try:
+            datetime.date.fromisoformat(v)
+            return v
+        except ValueError:
+            return ""
+    return ""
+
+
+def _clean_record(law_id: str, info: dict):
+    """Validate one revision record (from the API or from the local cache)."""
+    rid = info.get("law_revision_id") or info.get("rid")
+    if not isinstance(rid, str) or not REVISION_ID_RE.match(rid) or rid.split("_")[0] != law_id:
+        return None
+    ymd = rid.split("_")[1]
+    enf = norm_date(info.get("amendment_enforcement_date") or info.get("enf")) or norm_date(f"{ymd[:4]}-{ymd[4:6]}-{ymd[6:]}")
+    if not enf:
+        return None
+    aid = clean_text(info.get("amendment_law_id") or info.get("amend_id"), 64)
+    return {
+        "law_id": law_id,
+        "rid": rid,
+        "enf": enf,
+        "prom": norm_date(info.get("amendment_promulgate_date") or info.get("prom")),
+        "amend_id": aid if LAW_ID_RE.match(aid) else "",
+        "amend_title": clean_text(info.get("amendment_law_title") or info.get("amend_title")),
+        "amend_num": clean_text(info.get("amendment_law_num") or info.get("amend_num")),
+        "status": clean_text(info.get("current_revision_status") or info.get("status"), 40),
+        "title": clean_text(info.get("law_title") or info.get("title")),
+    }
+
+
+def parse_revisions(data, law_id: str) -> list:
+    revs = data.get("revisions") if isinstance(data, dict) else None
+    if not isinstance(revs, list):
+        raise ImportError_(f"revision list for {law_id} has an unexpected format")
+    out = []
+    for r in revs:
+        if not isinstance(r, dict):
+            continue
+        info = r.get("revision_info")
+        rec = _clean_record(law_id, info if isinstance(info, dict) else r)
+        if rec:
+            out.append(rec)
+    if not out:
+        raise ImportError_(f"no usable revisions for {law_id}")
+    return out
+
+
+def _retry(fn):
+    """Retry transient failures; never retry HTTP 4xx."""
+    last = None
+    for attempt in range(RETRIES):
+        try:
+            return fn()
+        except ImportError_ as e:
+            last = e
+            if "HTTP 4" in str(e) or attempt == RETRIES - 1:
+                break
+            time.sleep(min(30, 2 * (attempt + 1)))
+    raise last
+
+
+def fetch_revision_list(law_id: str, cache_dir, refresh: bool):
+    """Return (records, used_network). Records are cached under .git/ (never in the work tree)."""
+    if not LAW_ID_RE.match(law_id):
+        raise ImportError_(f"invalid law id: {law_id!r}")
+    cache = cache_dir / f"{law_id}.json" if cache_dir else None
+    if cache is not None and cache.is_file() and not refresh:
+        try:
+            cached = json.loads(cache.read_text(encoding="utf-8"))
+            recs = [r for r in (_clean_record(law_id, c) for c in cached if isinstance(c, dict)) if r]
+            if recs:
+                return recs, False
+        except (OSError, ValueError, TypeError):
+            pass
+    raw = _retry(lambda: _get(f"{API_BASE}/law_revisions/{urllib.parse.quote(law_id)}", "application/json"))
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError) as e:
+        raise ImportError_(f"revision list for {law_id} is not valid JSON: {e}")
+    recs = parse_revisions(data, law_id)
+    if cache is not None:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        write_atomic(cache, json.dumps(recs, ensure_ascii=False))
+    return recs, True
+
+
+def git(repo: Path, *args: str, env_extra=None, input_text=None) -> str:
+    env = {k: v for k, v in os.environ.items()
+           if k not in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY", "GIT_COMMON_DIR")}
+    env.update(env_extra or {})
+    try:
+        r = subprocess.run(["git", "-C", str(repo), *args], input=input_text, capture_output=True,
+                           text=True, encoding="utf-8", env=env, check=False)
+    except OSError as e:
+        raise ImportError_(f"cannot run git: {e}")
+    if r.returncode != 0:
+        raise ImportError_(f"git {args[0]} failed: {(r.stderr or r.stdout).strip()}")
+    return r.stdout
+
+
+def history_preflight(repo: Path) -> None:
+    if not (repo / ".git").exists():
+        raise ImportError_("--history --write needs a Git repository (run `lawgit init` first)")
+    top = git(repo, "rev-parse", "--show-toplevel").strip()
+    if Path(top).resolve() != repo.resolve():
+        raise ImportError_(f"{repo} is not the top level of its Git repository ({top}); refusing to commit there")
+    for line in git(repo, "status", "--porcelain=v1", "--untracked-files=all").splitlines():
+        path = line[3:]
+        if path.endswith(".gitkeep"):
+            continue
+        if line[:2] != "??" and line[0] != " ":
+            raise ImportError_("there are staged changes; commit or unstage them first")
+        if path.startswith("laws/") or path.startswith('"laws/'):
+            raise ImportError_(f"uncommitted changes in laws/ ({path}); commit or discard them first")
+
+
+def done_revisions(repo: Path) -> set:
+    try:
+        out = git(repo, "log", "--format=%B")
+    except ImportError_ as e:
+        if "does not have any commits" in str(e) or "bad default revision" in str(e):
+            return set()
+        raise
+    return {l.split(":", 1)[1].strip() for l in out.splitlines() if l.startswith("E-Gov-Revision:")}
+
+
+def epoch_for(date_s: str) -> int:
+    y, m, d = (int(x) for x in date_s.split("-"))
+    ts = int(datetime.datetime(y, m, d, tzinfo=JST).timestamp())
+    return max(ts, 86400)  # Git cannot represent dates before 1970; the real date stays in the message
+
+
+def group_key(r: dict) -> tuple:
+    if r["amend_id"]:
+        return (r["enf"], r["prom"], r["amend_id"], "")
+    return (r["enf"], r["prom"], "", r["law_id"])
+
+
+def make_groups(recs: list) -> list:
+    recs = sorted(recs, key=lambda r: group_key(r) + (r["law_id"], r["rid"]))
+    groups: list = []
+    last = None
+    for r in recs:
+        k = group_key(r)
+        if k != last:
+            groups.append([])
+            last = k
+        groups[-1].append(r)
+    return groups
+
+
+def build_message(group: list, names: dict) -> str:
+    first = group[0]
+    n = len(group)
+    amend = first["amend_title"] or first["amend_num"]
+    titles = [names.get(r["rid"]) or r["title"] or r["law_id"] for r in group]
+    if first["amend_id"] or amend:
+        subject = f"{titles[0]}: {amend or '改正'}による改正" if n == 1 else f"{amend or '改正'}による改正 ({n}法令)"
+    else:
+        subject = f"{titles[0]}: 制定・初出版" if n == 1 else f"制定・初出版 ({n}法令)"
+    lines = [clean_text(subject), ""]
+    lines += [f"- {t} [{r['law_id']}]" for r, t in zip(group, titles)]
+    lines.append("")
+    if first["amend_num"] or first["amend_id"]:
+        lines.append(f"Amending-Law: {first['amend_num']} {first['amend_id']}".strip())
+    if first["prom"]:
+        lines.append(f"Promulgated: {first['prom']}")
+    lines.append(f"Enforced: {first['enf']}")
+    lines += [f"E-Gov-Revision: {r['rid']}" for r in group]
+    return "\n".join(lines) + "\n"
+
+
+def render_revision(data: bytes, egov_id: str, uuid_s: str):
+    law = find_law_element(parse_untrusted_xml(data))
+    text = build_lawgit_xml(law, uuid_s, egov_id)
+    self_check(text, uuid_s, egov_id)
+    return text, law_metadata(law)["name"]
+
+
+def uuid_for(repo: Path, uuid_of: dict, law_id: str) -> str:
+    if law_id not in uuid_of:
+        u = fresh_uuid(repo)
+        while u in uuid_of.values():
+            u = fresh_uuid(repo)
+        uuid_of[law_id] = u
+    return uuid_of[law_id]
+
+
+def run_history(args, repo: Path, law_ids: list, known: dict) -> int:
+    """Restore past amendments as Git commits (oldest first, one commit per amending act)."""
+    delay = args.delay
+    is_git = (repo / ".git").exists()
+    cache_dir = repo / ".git" / "lawgit-egov-cache" if (repo / ".git").is_dir() else None
+    if args.write:
+        history_preflight(repo)
+    elif args.all:
+        print(f"history plan: would fetch the revision list of {len(law_ids)} law(s) and then every missing "
+              f"revision (dry-run: no requests made; try explicit IDs to see a real plan)")
+        return 0
+    done = done_revisions(repo) if is_git else set()
+
+    recs: list = []
+    failures = streak = 0
+    for n, law_id in enumerate(law_ids):
+        try:
+            rs, net = fetch_revision_list(law_id, cache_dir, args.refresh)
+            recs.extend(rs)
+            streak = 0
+            if net:
+                time.sleep(delay)
+            if (n + 1) % 100 == 0:
+                print(f"  revision lists: {n + 1}/{len(law_ids)}", flush=True)
+        except ImportError_ as e:
+            failures += 1
+            streak += 1
+            print(f"ERROR   {law_id}: {e}", file=sys.stderr, flush=True)
+            if streak >= MAX_CONSECUTIVE_FAILURES:
+                print("aborting: too many consecutive failures (re-run later; cached lists are reused)", file=sys.stderr)
+                return 1
+
+    today = datetime.date.today().isoformat()
+    sel = [r for r in recs
+           if r["rid"] not in done
+           and (args.include_unenforced or (r["status"] != "UnEnforced" and r["enf"] <= today))]
+    groups = make_groups(sel)
+    print(f"history: {len(recs)} revision(s) known, {len(recs) - len(sel)} skipped (done/not yet in force), "
+          f"{len(sel)} to restore in {len(groups)} commit(s)", flush=True)
+    if not args.write:
+        for g in groups[:10]:
+            print(f"  {g[0]['enf']}  {len(g)} law(s)  {build_message(g, {}).splitlines()[0]}")
+        print("\n(dry-run: nothing was downloaded, written or committed; add --write)")
+        return 1 if failures else 0
+
+    uuid_of = {}
+    for eid, path in known.items():
+        if UUID_V4_RE.match(path.stem):
+            uuid_of[eid] = path.stem
+    committed = 0
+    streak = 0
+    for gi, group in enumerate(groups):
+        items = []
+        try:
+            for rec in group:
+                try:
+                    time.sleep(delay)
+                    data = _retry(lambda rid=rec["rid"]: fetch_law_xml(rid, None))
+                    u = uuid_for(repo, uuid_of, rec["law_id"])
+                    text, name = render_revision(data, rec["law_id"], u)
+                    items.append((rec, u, text, name))
+                    streak = 0
+                except ImportError_ as e:
+                    failures += 1
+                    streak += 1
+                    print(f"ERROR   {rec['rid']}: {e}", file=sys.stderr, flush=True)
+                    if streak >= MAX_CONSECUTIVE_FAILURES:
+                        print("aborting: too many consecutive failures (re-run later; finished commits are kept)", file=sys.stderr)
+                        return 1
+            changed = []
+            for rec, u, text, name in items:
+                target = repo / "laws" / f"{u}.xml"
+                if target.resolve().parent != (repo / "laws").resolve():
+                    raise ImportError_("refusing to write outside laws/")
+                if target.exists() and target.read_text(encoding="utf-8") == text:
+                    continue
+                write_atomic(target, text)
+                changed.append(f"laws/{u}.xml")
+            if not changed:
+                continue
+            git(repo, "add", "--", *changed)
+            stamp = f"@{epoch_for(group[0]['enf'])} +0900"
+            env = {"GIT_AUTHOR_NAME": HISTORY_AUTHOR[0], "GIT_AUTHOR_EMAIL": HISTORY_AUTHOR[1],
+                   "GIT_COMMITTER_NAME": HISTORY_AUTHOR[0], "GIT_COMMITTER_EMAIL": HISTORY_AUTHOR[1],
+                   "GIT_AUTHOR_DATE": stamp, "GIT_COMMITTER_DATE": stamp}
+            msg = build_message([i[0] for i in items], {i[0]["rid"]: i[3] for i in items})
+            git(repo, "-c", "commit.gpgsign=false", "commit", "--no-verify", "-q", "-F", "-",
+                env_extra=env, input_text=msg)
+            committed += 1
+            print(f"[{gi + 1}/{len(groups)}] COMMIT {group[0]['enf']} {len(changed)} file(s): {msg.splitlines()[0]}", flush=True)
+        except ImportError_ as e:
+            print(f"error: {e}", file=sys.stderr)
+            print("stopped; fix the problem and re-run (finished revisions are skipped).", file=sys.stderr)
+            return 2
+        except KeyboardInterrupt:
+            print("\ninterrupted; if laws/ has uncommitted changes run `git checkout -- laws` before re-running.", file=sys.stderr)
+            return 1
+    print(f"\nhistory summary: {committed} commit(s) created, {failures} failure(s)")
+    return 1 if failures else 0
+
+
 def main(argv: list[str]) -> int:
     ap = argparse.ArgumentParser(description="Import e-Gov laws into a lawgit repository (separate from the Rust CLI).")
     ap.add_argument("law_ids", nargs="*", help="e-Gov law IDs, e.g. 415AC0000000057")
     ap.add_argument("--repo", default=".", help="lawgit repository (must contain laws/)")
+    ap.add_argument("--all", action="store_true",
+                    help="import EVERY law listed by e-Gov (thousands of requests; needs --yes together with --write)")
+    ap.add_argument("--max", type=int, default=None, metavar="N", help="with --all: stop after N laws (for trial runs)")
+    ap.add_argument("--delay", type=float, default=1.0, metavar="SEC",
+                    help=f"seconds between requests (default 1.0, minimum {MIN_DELAY})")
+    ap.add_argument("--yes", action="store_true", help="confirm a bulk --all --write run")
     ap.add_argument("--from-file", help="convert a local e-Gov XML file instead of downloading (offline)")
     ap.add_argument("--law-id", help="e-Gov law ID to record when using --from-file")
     ap.add_argument("--asof", help="point-in-time snapshot YYYY-MM-DD (enforcement date)")
+    ap.add_argument("--history", action="store_true",
+                    help="restore past amendments as Git commits (oldest first; one commit per amending act)")
+    ap.add_argument("--include-unenforced", action="store_true", help="with --history: also restore not-yet-in-force revisions")
+    ap.add_argument("--refresh", action="store_true", help="with --history: ignore the cached revision lists")
     ap.add_argument("--write", action="store_true", help="actually write files (default: dry-run)")
     ap.add_argument("--update", action="store_true", help="overwrite laws that are already imported")
     args = ap.parse_args(argv)
@@ -285,11 +649,28 @@ def main(argv: list[str]) -> int:
     if not (repo / "laws").is_dir():
         print(f"error: {repo}/laws not found; run `lawgit --repo {repo} init` first", file=sys.stderr)
         return 2
-    if bool(args.from_file) == bool(args.law_ids):
-        print("error: give law IDs, or --from-file (not both)", file=sys.stderr)
+    modes = [bool(args.from_file), bool(args.law_ids), args.all]
+    if sum(modes) != 1:
+        print("error: give exactly one of: law IDs, --all, --from-file", file=sys.stderr)
         return 2
     if args.from_file and not (args.law_id and LAW_ID_RE.match(args.law_id)):
         print("error: --from-file requires a valid --law-id", file=sys.stderr)
+        return 2
+    if args.history and args.from_file:
+        print("error: --history cannot be used with --from-file", file=sys.stderr)
+        return 2
+    if (args.include_unenforced or args.refresh) and not args.history:
+        print("error: --include-unenforced / --refresh require --history", file=sys.stderr)
+        return 2
+    if args.max is not None and (not args.all or args.max < 1):
+        print("error: --max must be >= 1 and is only valid with --all", file=sys.stderr)
+        return 2
+    if args.delay < MIN_DELAY:
+        print(f"error: --delay must be at least {MIN_DELAY} seconds", file=sys.stderr)
+        return 2
+    if args.all and args.write and not args.yes:
+        print("error: --all --write downloads every law; add --yes to confirm "
+              "(try --all --max 5 --write --yes first)", file=sys.stderr)
         return 2
 
     known = existing_by_egov_id(repo / "laws")
@@ -304,24 +685,61 @@ def main(argv: list[str]) -> int:
             print("error: file too large", file=sys.stderr)
             return 2
         jobs.append((args.law_id, raw))
+    elif args.all:
+        try:
+            all_ids = list_all_law_ids(args.asof, args.max, args.delay)
+        except ImportError_ as e:
+            print(f"error: cannot list laws: {e}", file=sys.stderr)
+            return 2
+        if args.history:
+            try:
+                return run_history(args, repo, all_ids, known)
+            except ImportError_ as e:
+                print(f"error: {e}", file=sys.stderr)
+                return 2
+        todo = [i for i in all_ids if args.update or i not in known]
+        print(f"e-Gov lists {len(all_ids)} law(s); {len(all_ids) - len(todo)} already imported; "
+              f"{len(todo)} to process (~{int(len(todo) * (args.delay + 1) / 60)} min at --delay {args.delay}).")
+        if not args.write:
+            print("first IDs: " + ", ".join(todo[:10]))
+            print("\n(dry-run: nothing was downloaded or written; add --write --yes to import)")
+            return 0
+        jobs = [(i, None) for i in todo]
     else:
+        if args.history:
+            try:
+                return run_history(args, repo, args.law_ids, known)
+            except ImportError_ as e:
+                print(f"error: {e}", file=sys.stderr)
+                return 2
         jobs = [(i, None) for i in args.law_ids]
 
-    failures = 0
+    done = failures = streak = 0
     for n, (egov_id, raw) in enumerate(jobs):
         try:
             if raw is None:
                 if n > 0:
-                    time.sleep(1.0)  # be polite to the public API
+                    time.sleep(args.delay)  # be polite to the public API
                 raw = fetch_law_xml(egov_id, args.asof)
-            print(import_one(repo, egov_id, raw, args.write, args.update, known))
+            print(f"[{n + 1}/{len(jobs)}] " + import_one(repo, egov_id, raw, args.write, args.update, known), flush=True)
+            done += 1
+            streak = 0
         except ImportError_ as e:
             failures += 1
-            print(f"ERROR   {egov_id}: {e}", file=sys.stderr)
+            streak += 1
+            print(f"[{n + 1}/{len(jobs)}] ERROR   {egov_id}: {e}", file=sys.stderr, flush=True)
+            if streak >= MAX_CONSECUTIVE_FAILURES:
+                print(f"aborting: {streak} consecutive failures (re-run later; finished laws are skipped)", file=sys.stderr)
+                break
+        except KeyboardInterrupt:
+            print("\ninterrupted (re-run to resume; finished laws are skipped)", file=sys.stderr)
+            failures += 1
+            break
+    print(f"\nsummary: {done} processed, {failures} failed")
     if args.write:
-        print("\nNext: lawgit validate; review with `git diff`; then git add / git commit.")
+        print("Next: lawgit validate; review with `git diff`; then git add / git commit.")
     else:
-        print("\n(dry-run: nothing was written; add --write to apply)")
+        print("(dry-run: nothing was written; add --write to apply)")
     return 1 if failures else 0
 
 

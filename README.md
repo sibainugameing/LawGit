@@ -93,6 +93,38 @@ lawgit --repo legal-data validate && cd legal-data && git diff   # 確認して�
 - DOCTYPE / ENTITY を含む XML は解析前に拒否。取得データは実行・評価しない。
 - 既に取り込み済みの法令は `--update` を付けない限り上書きしない。UUID は既存のものを保持（不変）。自動 commit はしない。
 - 変換: `LawNum`→`law-number`、`LawType`→`type`（Act→法律 など）、`LawTitle`→`name`、`LawBody` 配下→`<body>`（e-Gov の要素語彙のまま構造保持）。
+### 全法令の一括インポート
+
+```sh
+python3 tools/egov_import.py --repo legal-data --all                              # 件数確認のみ（dry-run）
+python3 tools/egov_import.py --repo legal-data --all --max 5 --write --yes        # まず 5 件で試す
+python3 tools/egov_import.py --repo legal-data --all --write --yes --delay 1.0    # 全件（数千リクエスト＝数時間）
+```
+
+- 一覧 API（`/laws`）をページ送りして全法令の ID を収集し、順に取り込みます。`--all --write` は誤爆防止のため `--yes` が必要です。
+- 取り込み済みの法令は自動でスキップするので、中断しても再実行で続きから再開できます。10 回連続で失敗したら中止します。
+- `--delay`（既定 1 秒、最小 0.5 秒）で公開 API への負荷を抑えます。
+
+### 過去の改正履歴を Git に自動復元（`--history`）
+
+```sh
+python3 tools/egov_import.py --repo legal-data 415AC0000000057 --history           # 計画の表示のみ
+python3 tools/egov_import.py --repo legal-data 415AC0000000057 --history --write   # commit を作成
+python3 tools/egov_import.py --repo legal-data --all --history --write --yes       # 全法令の全履歴
+```
+
+各法令の改正版一覧（`/law_revisions/{法令ID}`）を取得し、版ごとの XML を **施行日の古い順** に commit します。
+
+- **1 改正法 = 1 commit**: 同じ改正法・同じ施行日で複数の法令が変わった場合は、影響する全 XML を同じ commit に含めます（規格 7 章・README の運用どおり）。
+- commit 日時は施行日（JST 0:00）です。1970 年より前は Git が表現できないため 1970-01-02 に丸め、実際の日付は commit メッセージ（`Enforced:` / `Promulgated:`）に残します。
+- commit メッセージ末尾に `Amending-Law:`（改正法令番号・ID）と `E-Gov-Revision:`（版 ID）を記録します。これを手掛かりに、再実行時は復元済みの版をスキップします（冪等・再開可能）。
+- 作者は固定の `e-Gov Import <egov-import@lawgit.invalid>`。committer 日時も施行日に揃えるため、同じ入力なら同じ内容の履歴になります。
+- 既定では未施行の将来版は除外します（`--include-unenforced` で含める）。最終状態は現行施行版になります。
+- 改正版一覧は `.git/lawgit-egov-cache/` にキャッシュします（作業ツリーは汚しません。`--refresh` で無視）。
+- **安全のための前提**: 書き込み時は、リポジトリ最上位であること・ステージ済み変更が無いこと・`laws/` に未コミット変更が無いことを確認し、満たさなければ何も変更せず中止します。commit は `--no-verify`（フック無効）で行い、メッセージは標準入力経由で渡します。取得したメタデータは制御文字を除去します。
+- 注意: 中断後に再実行すると、取得に失敗して後回しになった版は、より新しい commit の後ろに追加されます（日付は施行日のまま）。
+- 注意: 履歴データの範囲は e-Gov の収録範囲に依存します（v2 は平成 29 年 4 月 1 日以降のデータに対応）。
+
 - テスト: `python3 tools/test_egov_import.py`（オフライン）。
 - 注意: e-Gov API への実通信は、この開発環境では確認できていません。初回は dry-run、または `--from-file` で試してください。
 
