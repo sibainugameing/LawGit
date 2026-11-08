@@ -768,7 +768,7 @@ def _main_impl(argv: list[str]) -> int:
               f"{len(todo)} to process (~{int(len(todo) * (args.delay + 1) / 60)} min at --delay {args.delay}).")
         if not args.write:
             print("first IDs: " + ", ".join(todo[:10]))
-            print("\n(dry-run: nothing was downloaded or written; add --write --yes to import)")
+            print("\n(dry-run: no law XML was downloaded or written; add --write to import)")
             return 0
         jobs = [(i, None) for i in todo]
     else:
