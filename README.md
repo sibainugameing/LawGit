@@ -139,18 +139,24 @@ python3 tools/egov_import.py --repo legal-data --promulgated-from 2020-01-01
 python3 tools/egov_import.py --repo legal-data \
   --promulgated-from 2020-01-01 --promulgated-to 2020-12-31
 
-# 2020年以降に公布された法令を実際に取り込む
+# 2020年以降に公布された法令の現行 XML だけを取り込む
 python3 tools/egov_import.py --repo legal-data \
   --promulgated-from 2020-01-01 --write
 
-# まず 5 件だけ実際に取り込んで確認する
+# 2020年以降に公布された法令の改正履歴も Git commit として復元する
 python3 tools/egov_import.py --repo legal-data \
-  --promulgated-from 2020-01-01 --max 5 --write
+  --promulgated-from 2020-01-01 --history --write
+
+# まず 5 法令だけ履歴復元を試す
+python3 tools/egov_import.py --repo legal-data \
+  --promulgated-from 2020-01-01 --max 5 --history --write
 ```
 
 - `--promulgated-from` は指定日以後、`--promulgated-to` は指定日以前を含みます。どちらか一方だけでも指定できます。
 - e-Gov API v2 の一覧 API（`/laws`）に `promulgation_date_from` / `promulgation_date_to` を渡して絞り込みます。全一覧を取得してからローカルで除外する方式ではありません。
 - 日付範囲を指定すると一覧取得モードになり、`--all` は不要です。日付フィルターは法令そのものの公布日が対象で、改正履歴の公布日・施行日を絞るものではありません。
+- `--write` だけでは現行 XML のみを保存します。各法令の過去の改正版を Git commit として復元するには、必ず `--history --write` を指定してください。
+- `--history` と日付フィルターを組み合わせた場合、公布日範囲に該当する法令を選び、その法令の取得可能な履歴を復元します。改正履歴そのものを指定期間で絞る動作ではありません。
 - 既定は dry-run です。対象 ID と件数を確認してから `--write` を付けてください。
 
 ### 全法令の一括インポート
