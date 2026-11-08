@@ -735,6 +735,10 @@ def _main_impl(argv: list[str]) -> int:
               "(try --all --max 5 --write --yes first)", file=sys.stderr)
         return 2
 
+    if args.write and not args.from_file and not args.history:
+        print("note: --history was not specified; only the current law text will be imported. "
+              "Add --history to restore revision history as Git commits.", file=sys.stderr)
+
     known = existing_by_egov_id(repo / "laws")
     jobs: list[tuple[str, bytes | None]] = []
     if args.from_file:
