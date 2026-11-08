@@ -371,3 +371,153 @@ client = LawGitClient("http://127.0.0.1:8787")
 - [OpenAPI 3.0.3](openapi.json): HTTP API の機械可読仕様
 - [API.md](API.md): API の概要・メソッド表・接続例
 - [README](../README.md): CLI とリポジトリ運用
+
+
+---
+
+## 実装仕様の補足（API 共通メソッド群）
+
+以下は `src/api.rs` の共通メソッド群に基づく補足です。CLI JSON、stdio JSON-lines、HTTP は同じ API メソッドを共有します。
+
+### RPC メソッド一覧
+
+| method | params | result |
+|---|---|---|
+| `ping` | なし | `{name, version, root, auto_commit}` |
+| `methods` | なし | メソッド名配列 |
+| `law.list` | なし | `{laws:[{uuid,name,type,law_number,e_gov_id,path,version}], errors:[]}` |
+| `law.get` | `uuid` | `{law, xml}` |
+| `law.create` | `name, type, law_number?, e_gov_id?, commit_message?` | 作成した法令（＋commit） |
+| `law.validate` | なし | `{valid, laws, errors}` |
+| `law.history` | `uuid, limit?` | `{commits:[{hash,author,date,subject}]}` |
+| `law.revision` | `uuid, rev` | `{rev, xml}` |
+| `rule.list` | `category?, query?` | `{rules:[...], errors:[]}` |
+| `rule.get` | `uuid` | ルール（body・version を含む） |
+| `rule.create` | `name, category?, body?, commit_message?` | 作成したルール（＋commit） |
+| `rule.update` | `uuid, name?, category?, body?, if_version?, commit_message?` | 更新後ルール（＋commit） |
+| `rule.delete` | `uuid, if_version?, commit_message?` | `{deleted}`（＋commit） |
+| `rule.validate` | なし | `{valid, rules, errors}` |
+| `rule.history` / `rule.revision` | `law.*` の履歴系と同様 | 削除済みルールの履歴・過去版も取得可能 |
+| `search` | `q, limit?`（既定 50） | `{query, hits:[{kind,uuid,name,matched,snippet}], truncated}` |
+| `changes` | `since?, limit?` | `{head, commits:[{hash,date,subject,files:[{status,path}]}]}`（新しい順） |
+| `repo.check` | なし | `{valid, laws, rules, errors}` |
+| `git.status` | なし | Git 状態 |
+| `git.log` | `limit?` | Git 履歴 |
+| `git.commit` | `message` | 検証付き一括 commit |
+
+### 自動コミットの詳細
+
+LawGit 経由の変更を自動 commit する設定:
+
+```sh
+lawgit config autocommit on
+lawgit config autocommit off
+lawgit rule new --name X --commit
+LAWGIT_AUTOCOMMIT=1 lawgit serve
+lawgit serve --commit
+```
+
+優先順位:
+
+1. `--commit` / `--no-commit`
+2. `LAWGIT_AUTOCOMMIT`
+3. `git config lawgit.autocommit`
+4. OFF
+
+変更したファイルだけを対象に 1 変更 = 1 commit とし、他のステージ済み作業を巻き込みません。内容に変化がなければ空 commit は作成しません。CLI は `-m)、API は `commit_message` でメッセージを指定できます。
+
+commit に失敗してもファイル変更は残ります。CLI は終了コード 1、API は結果の `commit` に `{"error":"..."}` を返します。アプリは保存成功と commit 成功を分けて表示してください。自動コミット状態は `ping` の `auto_commit` で確認できます。
+
+### 競合検出
+
+取得結果の `version` はファイル内容のハッシュです。更新・削除時に `if_version` を送ると、取得後に他のクライアントが変更した場合、HTTP 409 / conflict となり書き込みは行われません。
+
+推奨手順:
+
+1. GET でデータと `version` を取得。
+2. 編集中は version を保持。
+3. PUT / PATCH / DELETE に `if_version` を付ける。
+4. 409 の場合は最新データを再取得し、差分をユーザーに提示。
+
+Python クライアントの `edit_rule(uuid, callback)` は読み取り→更新→競合時の再試行を行います。callback は最新データに対して安全に再適用できる処理にしてください。
+
+### changes / watch による同期
+
+`changes` API は push 通知の代わりにポーリングで更新を追従する仕組みです。
+
+初回に `GET /api/v1/changes?limit=1` を呼び、返却された `head` を保存します。その後は `GET /api/v1/changes?since=<保存した head>` を呼び、差分 commit と変更ファイルを取得します。結果は新しい順なので、順序依存の処理では古い順に並べ替えてください。
+
+Python クライアント:
+
+```python
+for commit in c.watch():  # デフォルト 2 秒間隔、古い commit から yield
+    print(commit["subject"], [f["path"] for f in commit["files"]])
+```
+
+commit hash を同期 checkpoint として保存し、再起動後に再開できるようにしてください。
+
+### stdio JSON-lines
+
+```sh
+printf '%s\\n' '{"id":1,"method":"ping"}' \
+  '{"id":2,"method":"rule.create","params":{"name":"休暇規則","category":"人事","body":"# 休暇"}}' \
+  | lawgit --repo legal-data rpc
+```
+
+1 行につき 1 リクエスト。レスポンスはリクエストの `id` を返す 1 行 JSON です。
+
+### HTTP API パス一覧
+
+| HTTP | Path |
+|---|---|
+| GET | `/api/v1/ping`, `/methods`, `/validate`, `/openapi.json` |
+| GET | `/api/v1/search?q=...&limit=...` |
+| GET | `/api/v1/changes?since=...&limit=...` |
+| GET / POST | `/api/v1/laws` |
+| GET | `/api/v1/laws/{uuid}`, `/laws/{uuid}/history`, `/laws/{uuid}/revisions/{rev}` |
+| GET / POST | `/api/v1/rules`（GET: `?category=&query=`） |
+| GET / PUT / PATCH / DELETE | `/api/v1/rules/{uuid}` |
+| GET | `/api/v1/rules/{uuid}/history`, `/rules/{uuid}/revisions/{rev}` |
+| GET | `/api/v1/git/status`, `/git/log?limit=...` |
+| POST | `/api/v1/git/commit`, `/api/v1/rpc` |
+
+### HTTP 呼び出し例
+
+ルール作成:
+
+```sh
+curl -s -X POST http://localhost:8787/api/v1/rules \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"休暇規則","category":"人事","body":"# 休暇"}'
+```
+
+ルール更新（取得した version を使う）:
+
+```sh
+curl -s -X PUT http://localhost:8787/api/v1/rules/UUID \
+  -H 'Content-Type: application/json' \
+  -d '{"body":"# 更新","if_version":"取得時のversion"}'
+```
+
+token 認証:
+
+```sh
+curl -s -H 'Authorization: Bearer SECRET' http://host:8787/api/v1/ping
+```
+
+### CORS
+
+- 既定では CORS を許可しません。
+- `--cors-origin` に許可 Origin を完全一致で指定します。複数はカンマ区切り。
+- ワイルドカード `*` は不可。CORS 設定時は `--token` が必須。
+- OPTIONS プリフライトは許可 Origin に 204 を返し、token は実リクエストで検証します。
+
+### 安全設計と制限
+
+- 既定は `127.0.0.1`。非ループバック bind は token 必須。
+- ループバックで token 無しの場合、Host ヘッダー検証により DNS rebinding を防止。
+- 書き込みは JSON Content-Type 必須。
+- UUID / commit ID は形式検証後に利用し、パストラバーサル・Git オプション注入を防ぐ。
+- 1 接続ずつ逐次処理。
+- リクエスト上限 1 MiB、タイムアウト 10 秒。
+- TLS は LawGit 本体では提供しない。外部公開時は TLS リバースプロキシを使用する。
