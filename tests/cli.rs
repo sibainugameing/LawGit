@@ -20,6 +20,8 @@ fn run(repo: &Path, args: &[&str]) -> (i32, String, String) {
         .arg("--repo")
         .arg(repo)
         .args(args)
+        .env_remove("LAWGIT_AUTOCOMMIT")
+        .env_remove("LAWGIT_TOKEN")
         .output()
         .expect("failed to run lawgit");
     (
@@ -276,7 +278,7 @@ fn http(port: u16, method: &str, path: &str, host: &str, extra: &str, body: Opti
     Some(out)
 }
 
-fn start_server(repo: &Path, extra: &[&str]) -> (Kill, u16) {
+fn start_server(repo: &Path, extra: &[&str], envs: &[(&str, &str)]) -> (Kill, u16) {
     let port = free_port();
     let child = Command::new(BIN)
         .arg("--repo")
@@ -285,7 +287,9 @@ fn start_server(repo: &Path, extra: &[&str]) -> (Kill, u16) {
         .arg("--port")
         .arg(port.to_string())
         .args(extra)
+        .envs(envs.iter().copied())
         .env_remove("LAWGIT_TOKEN")
+        .env_remove("LAWGIT_AUTOCOMMIT")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -307,7 +311,7 @@ const JSON_CT: &str = "Content-Type: application/json\r\n";
 #[test]
 fn http_api() {
     let repo = init_repo("http");
-    let (_srv, port) = start_server(&repo, &[]);
+    let (_srv, port) = start_server(&repo, &[], &[]);
 
     let r = http(port, "GET", "/api/v1/ping", "127.0.0.1", "", None).unwrap();
     assert!(r.contains("200 OK") && r.contains("\"ok\":true") && r.contains("\"version\""), "{}", r);
@@ -344,7 +348,7 @@ fn http_api() {
 #[test]
 fn http_token_required() {
     let repo = init_repo("token");
-    let (_srv, port) = start_server(&repo, &["--token", "s3cret"]);
+    let (_srv, port) = start_server(&repo, &["--token", "s3cret"], &[]);
     let r = http(port, "GET", "/api/v1/ping", "127.0.0.1", "", None).unwrap();
     assert!(r.contains("401"), "{}", r);
     let r = http(port, "GET", "/api/v1/ping", "127.0.0.1", "Authorization: Bearer wrong\r\n", None).unwrap();
@@ -369,5 +373,273 @@ fn serve_refuses_public_bind_without_token() {
     assert_eq!(out.status.code(), Some(2));
     let err = String::from_utf8_lossy(&out.stderr).to_string();
     assert!(err.contains("--token"), "{}", err);
+    let _ = fs::remove_dir_all(&repo);
+}
+
+// ------------------------------------------------------------------ auto-commit, search, history
+
+const ID_ENV: [(&str, &str); 4] = [
+    ("GIT_AUTHOR_NAME", "t"),
+    ("GIT_AUTHOR_EMAIL", "t@example.com"),
+    ("GIT_COMMITTER_NAME", "t"),
+    ("GIT_COMMITTER_EMAIL", "t@example.com"),
+];
+
+fn run_id(repo: &Path, args: &[&str]) -> (i32, String, String) {
+    let out = Command::new(BIN)
+        .arg("--repo")
+        .arg(repo)
+        .args(args)
+        .envs(ID_ENV)
+        .env_remove("LAWGIT_AUTOCOMMIT")
+        .output()
+        .expect("failed to run lawgit");
+    (
+        out.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&out.stdout).to_string(),
+        String::from_utf8_lossy(&out.stderr).to_string(),
+    )
+}
+
+fn git_out(repo: &Path, args: &[&str]) -> String {
+    let out = Command::new("git").arg("-C").arg(repo).args(args).output().expect("git failed to start");
+    String::from_utf8_lossy(&out.stdout).to_string()
+}
+
+fn json_fields(text: &str, key: &str) -> Vec<String> {
+    let pat = format!("\"{}\":\"", key);
+    let mut out = Vec::new();
+    let mut rest = text;
+    while let Some(i) = rest.find(pat.as_str()) {
+        let after = &rest[i + pat.len()..];
+        match after.find('"') {
+            Some(j) => {
+                out.push(after[..j].to_string());
+                rest = &after[j + 1..];
+            }
+            None => break,
+        }
+    }
+    out
+}
+
+#[test]
+fn auto_commit_cli() {
+    if !git_available() {
+        return;
+    }
+    let repo = init_repo("autocommit");
+    assert!(run_id(&repo, &["config"]).1.contains("autocommit = off"));
+    let (rc, out, _) = run_id(&repo, &["config", "autocommit", "on"]);
+    assert_eq!(rc, 0, "{}", out);
+    assert!(run_id(&repo, &["config"]).1.contains("autocommit = on"));
+    assert_eq!(run_id(&repo, &["config", "autocommit", "maybe"]).0, 2);
+
+    let (rc, out, err) = run_id(&repo, &["new", "--name", "道路交通法", "--type", "法律"]);
+    assert_eq!(rc, 0, "{}{}", out, err);
+    assert!(out.contains("Committed"), "{}", out);
+    let law = uuid_from(&out);
+    let subjects = git_out(&repo, &["log", "--format=%s"]);
+    assert!(subjects.contains(&format!("法令を追加: 道路交通法 [{}]", law)), "{}", subjects);
+    // only the new file is in the commit (README, .gitattributes, rules/.gitkeep stay untracked)
+    assert_eq!(git_out(&repo, &["show", "--name-only", "--format=", "HEAD"]).trim(), format!("laws/{}.xml", law));
+
+    let (rc, out, err) = run_id(&repo, &["rule", "new", "--name", "休暇規則", "--body", "v1"]);
+    assert_eq!(rc, 0, "{}{}", out, err);
+    let rule = uuid_from(&out);
+    assert_eq!(git_out(&repo, &["show", "--name-only", "--format=", "HEAD"]).trim(), format!("rules/{}.xml", rule));
+
+    let (rc, out, _) = run_id(&repo, &["rule", "set", rule.as_str(), "--body", "v2 有給"]);
+    assert_eq!(rc, 0);
+    assert!(out.contains("Committed"), "{}", out);
+    // setting the same content again creates no empty commit
+    let before = git_out(&repo, &["rev-list", "--count", "HEAD"]);
+    let (rc, out, _) = run_id(&repo, &["rule", "set", rule.as_str(), "--body", "v2 有給"]);
+    assert_eq!(rc, 0);
+    assert!(!out.contains("Committed"), "{}", out);
+    assert_eq!(git_out(&repo, &["rev-list", "--count", "HEAD"]), before);
+
+    // other staged work is never swept into an auto-commit
+    fs::write(repo.join("notes.txt"), "x").unwrap();
+    git_out(&repo, &["add", "notes.txt"]);
+    let (rc, _, _) = run_id(&repo, &["rule", "new", "--name", "別規則", "-m", "独自メッセージ"]);
+    assert_eq!(rc, 0);
+    assert!(git_out(&repo, &["log", "-1", "--format=%s"]).contains("独自メッセージ"));
+    assert!(git_out(&repo, &["status", "--porcelain"]).contains("A  notes.txt"));
+
+    // --no-commit wins over the stored setting
+    let (rc, out, _) = run_id(&repo, &["rule", "new", "--name", "未コミット", "--no-commit"]);
+    assert_eq!(rc, 0);
+    let pending = uuid_from(&out);
+    assert!(git_out(&repo, &["status", "--porcelain"]).contains(pending.as_str()));
+
+    // delete is recorded too, and history still works for deleted rules
+    let (rc, out, _) = run_id(&repo, &["rule", "delete", rule.as_str(), "--yes"]);
+    assert_eq!(rc, 0);
+    assert!(out.contains("Committed"), "{}", out);
+    assert!(git_out(&repo, &["log", "-1", "--format=%s"]).contains("ルールを削除"));
+    let (rc, hist, _) = run_id(&repo, &["history", rule.as_str()]);
+    assert_eq!(rc, 0);
+    assert!(hist.contains("ルールを削除") && hist.contains("ルールを更新") && hist.contains("ルールを追加"), "{}", hist);
+    let (_, hist_law, _) = run_id(&repo, &["history", law.as_str()]);
+    assert!(hist_law.contains("法令を追加"), "{}", hist_law);
+
+    let (rc, found, _) = run_id(&repo, &["search", "道路"]);
+    assert_eq!(rc, 0);
+    assert!(found.contains(law.as_str()), "{}", found);
+    assert_eq!(run_id(&repo, &["search", "   "]).0, 2);
+    let _ = fs::remove_dir_all(&repo);
+}
+
+#[test]
+fn auto_commit_via_environment_and_failure_reporting() {
+    if !git_available() {
+        return;
+    }
+    let repo = init_repo("autoenv");
+    let out = Command::new(BIN)
+        .arg("--repo")
+        .arg(&repo)
+        .args(["rule", "new", "--name", "環境変数"])
+        .envs(ID_ENV)
+        .env("LAWGIT_AUTOCOMMIT", "1")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("Committed"));
+
+    // --commit and --no-commit together are rejected
+    assert_eq!(run_id(&repo, &["rule", "new", "--name", "x", "--commit", "--no-commit"]).0, 2);
+
+    // a failing commit (no git identity) keeps the saved file and exits with 1
+    let out = Command::new(BIN)
+        .arg("--repo")
+        .arg(&repo)
+        .args(["rule", "new", "--name", "身元なし", "--commit"])
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .env("GIT_AUTHOR_NAME", "")
+        .env("GIT_COMMITTER_NAME", "")
+        .env("GIT_AUTHOR_EMAIL", "")
+        .env("GIT_COMMITTER_EMAIL", "")
+        .env("EMAIL", "")
+        .env("HOME", repo.as_os_str())
+        .output()
+        .unwrap();
+    let rc = out.status.code().unwrap_or(-1);
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    // Some systems can auto-detect an identity; accept that, but never a lost file or a crash.
+    assert!(rc == 0 || rc == 1, "rc={} {}", rc, String::from_utf8_lossy(&out.stderr));
+    assert!(stdout.contains("Created"), "{}", stdout);
+    let _ = fs::remove_dir_all(&repo);
+}
+
+#[test]
+fn openapi_command() {
+    let out = Command::new(BIN).arg("openapi").output().unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    let t = String::from_utf8_lossy(&out.stdout).to_string();
+    assert!(t.contains("\"openapi\":\"3.0.3\"") && t.contains("/rules/{uuid}"), "{}", t);
+}
+
+#[test]
+fn http_extended_api() {
+    if !git_available() {
+        return;
+    }
+    let repo = init_repo("httpext");
+    let (_srv, port) = start_server(&repo, &["--commit"], &ID_ENV);
+    let get = |path: &str| http(port, "GET", path, "127.0.0.1", "", None).unwrap();
+
+    let r = http(port, "POST", "/api/v1/rules", "127.0.0.1", JSON_CT, Some(r#"{"name":"同時編集","body":"v1"}"#)).unwrap();
+    assert!(r.contains("200 OK") && r.contains("\"commit\":{\"hash\""), "{}", r);
+    let uuid = json_fields(&r, "uuid")[0].clone();
+    let v1 = json_fields(&r, "version")[0].clone();
+
+    let r = get(&format!("/api/v1/rules/{}", uuid));
+    assert_eq!(json_fields(&r, "version")[0], v1);
+
+    let body = format!(r#"{{"body":"v2 有給","if_version":"{}"}}"#, v1);
+    let r = http(port, "PUT", &format!("/api/v1/rules/{}", uuid), "127.0.0.1", JSON_CT, Some(body.as_str())).unwrap();
+    assert!(r.contains("200 OK") && r.contains("ルールを更新"), "{}", r);
+    let v2 = json_fields(&r, "version")[0].clone();
+    assert_ne!(v1, v2);
+
+    // stale version -> 409 and nothing changes
+    let r = http(port, "PUT", &format!("/api/v1/rules/{}", uuid), "127.0.0.1", JSON_CT, Some(body.as_str())).unwrap();
+    assert!(r.contains("409") && r.contains("conflict"), "{}", r);
+    let r = get(&format!("/api/v1/rules/{}", uuid));
+    assert!(r.contains("v2 有給"), "{}", r);
+
+    // history, revisions
+    let h = get(&format!("/api/v1/rules/{}/history", uuid));
+    let hashes = json_fields(&h, "hash");
+    assert_eq!(hashes.len(), 2, "{}", h);
+    let old = get(&format!("/api/v1/rules/{}/revisions/{}", uuid, hashes[1]));
+    assert!(old.contains("200 OK") && old.contains("v1") && !old.contains("v2 有給"), "{}", old);
+    assert!(get(&format!("/api/v1/rules/{}/revisions/zzzz", uuid)).contains("400"));
+    assert!(get(&format!("/api/v1/rules/{}/revisions/{}", uuid, "0".repeat(40))).contains("404"));
+
+    // search + incremental changes
+    let r = get("/api/v1/search?q=%E6%9C%89%E7%B5%A6");
+    assert!(r.contains(uuid.as_str()) && r.contains("\"kind\":\"rule\""), "{}", r);
+    assert!(get("/api/v1/search?q=").contains("400"));
+    let all = get("/api/v1/changes");
+    assert!(all.contains("\"files\"") && all.contains(&format!("rules/{}.xml", uuid)), "{}", all);
+    let newer = get(&format!("/api/v1/changes?since={}", hashes[1]));
+    assert!(newer.contains("ルールを更新") && !newer.contains("ルールを追加"), "{}", newer);
+    assert!(get("/api/v1/changes?since=zz").contains("400"));
+
+    // delete with a stale version is refused, with the right one it is committed
+    let r = http(port, "DELETE", &format!("/api/v1/rules/{}?if_version={}", uuid, v1), "127.0.0.1", "", None).unwrap();
+    assert!(r.contains("409"), "{}", r);
+    let r = http(port, "DELETE", &format!("/api/v1/rules/{}?if_version={}", uuid, v2), "127.0.0.1", "", None).unwrap();
+    assert!(r.contains("200 OK") && r.contains("ルールを削除"), "{}", r);
+    let h = get(&format!("/api/v1/rules/{}/history", uuid));
+    assert_eq!(json_fields(&h, "hash").len(), 3, "{}", h);
+
+    // custom commit message, and OpenAPI document
+    let r = http(port, "POST", "/api/v1/laws", "127.0.0.1", JSON_CT, Some(r#"{"name":"新法","type":"法律","commit_message":"API経由で制定"}"#)).unwrap();
+    assert!(r.contains("API経由で制定"), "{}", r);
+    let r = get("/api/v1/openapi.json");
+    assert!(r.contains("200 OK") && r.contains("\"openapi\":\"3.0.3\"") && !r.contains("\"ok\":true"), "{}", r);
+    let _ = fs::remove_dir_all(&repo);
+}
+
+#[test]
+fn http_cors_is_opt_in_and_needs_token() {
+    let repo = init_repo("cors");
+    for bad in [&["--cors-origin", "http://app.example"][..], &["--cors-origin", "*", "--token", "t"][..]] {
+        let out = Command::new(BIN)
+            .arg("--repo")
+            .arg(&repo)
+            .arg("serve")
+            .args(["--port", "0"])
+            .args(bad)
+            .env_remove("LAWGIT_TOKEN")
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(2), "{:?}", bad);
+    }
+
+    let (_srv, port) = start_server(&repo, &["--token", "t", "--cors-origin", "http://app.example"], &[]);
+    let pre = "Origin: http://app.example\r\nAccess-Control-Request-Method: POST\r\n";
+    let r = http(port, "OPTIONS", "/api/v1/rules", "127.0.0.1", pre, None).unwrap();
+    assert!(r.contains("204") && r.contains("Access-Control-Allow-Origin: http://app.example"), "{}", r);
+    assert!(r.contains("Access-Control-Allow-Headers") && r.contains("Authorization"), "{}", r);
+    let r = http(port, "OPTIONS", "/api/v1/rules", "127.0.0.1", "Origin: http://evil.example\r\n", None).unwrap();
+    assert!(r.contains("403") && !r.contains("Access-Control-Allow-Origin"), "{}", r);
+    let r = http(
+        port,
+        "GET",
+        "/api/v1/ping",
+        "127.0.0.1",
+        "Origin: http://app.example\r\nAuthorization: Bearer t\r\n",
+        None,
+    )
+    .unwrap();
+    assert!(r.contains("200 OK") && r.contains("Access-Control-Allow-Origin: http://app.example"), "{}", r);
+    let r = http(port, "GET", "/api/v1/ping", "127.0.0.1", "Origin: http://evil.example\r\nAuthorization: Bearer t\r\n", None).unwrap();
+    assert!(r.contains("200 OK") && !r.contains("Access-Control-Allow-Origin"), "{}", r);
     let _ = fs::remove_dir_all(&repo);
 }

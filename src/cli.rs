@@ -7,10 +7,12 @@ use std::io::{self, BufRead, Write};
 use std::process::Command;
 
 use crate::api;
+use crate::autocommit;
 use crate::check;
 use crate::git;
 use crate::json::Json;
 use crate::law::{self, NewLaw};
+use crate::openapi;
 use crate::repo::Repo;
 use crate::rpc;
 use crate::rule;
@@ -45,13 +47,23 @@ LawGit - 法令・ルールを XML + Git で管理する / Manage laws and rules
   rule delete <UUID> --yes
   rule validate
 
-Git:
-  commit -m <message>           検証後、laws/ と rules/ を add して commit
-                                (通常は自動 commit しない。1 改正 = 1 commit を推奨)
+Git / 自動コミット:
+  commit -m <message>           検証後、laws/ と rules/ をまとめて commit
+  config autocommit [on|off]    自動コミットの設定を表示/変更 (リポジトリ内の git config に保存)
+  --commit / --no-commit        その実行だけ自動コミットを強制 ON / OFF (環境変数 LAWGIT_AUTOCOMMIT=1 でも可)
+                                ON の間、new / rule new・make・set・edit・delete と API の書き込みは
+                                「変更したファイルだけ」を 1 変更 = 1 commit で記録する。
+                                -m <message> で commit メッセージを指定できる (既定: 「ルールを更新: 名前 [UUID]」など)
+
+検索・履歴:
+  search <語句...>              法令・ルールを全文検索 (名前・番号・カテゴリ・本文)
+  history <UUID>                その法令/ルールを変更した commit の一覧 (削除済みも可)
 
 外部アプリ連携 / Integration:
-  serve [--host H] [--port P] [--token T]
+  serve [--host H] [--port P] [--token T] [--cors-origin ORIGIN[,ORIGIN...]] [--commit]
                                 ローカル HTTP JSON API (既定 127.0.0.1:8787, /api/v1/...)
+                                --cors-origin: ブラウザアプリ用 (完全一致のオリジンのみ。--token 必須)
+  openapi                       OpenAPI 3 仕様 (JSON) を出力 (サーバでは /api/v1/openapi.json)
   rpc                           stdin/stdout の JSON-lines インターフェース
   --json                        list / show / validate / check / rule ... を JSON で出力
 
@@ -81,9 +93,9 @@ impl Args {
 
 const VALUE_OPTS: &[&str] = &[
     "repo", "name", "type", "law-number", "e-gov-id", "category", "body", "body-file", "query",
-    "host", "port", "token", "message",
+    "host", "port", "token", "message", "cors-origin",
 ];
-const FLAG_OPTS: &[&str] = &["json", "help", "version", "yes"];
+const FLAG_OPTS: &[&str] = &["json", "help", "version", "yes", "commit", "no-commit"];
 
 fn parse_args(raw: &[String]) -> Result<Args, String> {
     let mut args = Args {
@@ -173,7 +185,13 @@ fn run_inner(raw: &[String]) -> Result<i32, String> {
         print!("{}", USAGE);
         return Ok(if args.flag("help") || (!args.pos.is_empty() && args.pos[0] == "help") { 0 } else { 2 });
     }
-    let repo = Repo::new(args.opt("repo").unwrap_or("."));
+    let auto = match (args.flag("commit"), args.flag("no-commit")) {
+        (true, true) => return Err("--commit and --no-commit cannot be used together".to_string()),
+        (true, false) => Some(true),
+        (false, true) => Some(false),
+        (false, false) => None,
+    };
+    let repo = Repo::new(args.opt("repo").unwrap_or(".")).with_auto_commit(auto);
     let json = args.flag("json");
     match args.pos[0].as_str() {
         "init" => cmd_init(&repo),
@@ -184,6 +202,13 @@ fn run_inner(raw: &[String]) -> Result<i32, String> {
         "show" => cmd_show(&repo, &args, json),
         "rule" => cmd_rule(&repo, &args, json),
         "commit" => cmd_commit(&repo, &args),
+        "config" => cmd_config(&repo, &args),
+        "search" => cmd_search(&repo, &args, json),
+        "history" => cmd_history(&repo, &args, json),
+        "openapi" => {
+            println!("{}", openapi::SPEC);
+            Ok(0)
+        }
         "serve" => cmd_serve(repo, &args),
         "rpc" => {
             rpc::run(&repo)?;
@@ -200,6 +225,31 @@ fn empty_params() -> Json {
 fn print_errors(errors: &[String]) {
     for e in errors {
         eprintln!("  - {}", e);
+    }
+}
+
+/// After a successful change: record it as one commit when auto-commit is on.
+/// A failed commit is reported (exit code 1) but never undoes the saved change.
+fn finish_commit(repo: &Repo, args: &Args, json: bool, paths: Vec<String>, default_msg: String) -> Result<i32, String> {
+    let msg = match args.opt("message") {
+        Some(m) => m.to_string(),
+        None => default_msg,
+    };
+    match autocommit::commit_change(repo, &paths, &msg) {
+        Ok(Some(h)) => {
+            let line = format!("Committed {}: {}", h, msg.lines().next().unwrap_or(""));
+            if json {
+                eprintln!("{}", line);
+            } else {
+                println!("{}", line);
+            }
+            Ok(0)
+        }
+        Ok(None) => Ok(0),
+        Err(e) => {
+            eprintln!("warning: the change was saved, but auto-commit failed: {}", e);
+            Ok(1)
+        }
     }
 }
 
@@ -230,7 +280,13 @@ fn cmd_new(repo: &Repo, args: &Args) -> Result<i32, String> {
     println!("Created {}", info.path.display());
     println!("UUID: {}", info.uuid);
     println!("Edit the <body> of the file to add the legal text, then run `validate`.");
-    Ok(0)
+    finish_commit(
+        repo,
+        args,
+        false,
+        vec![format!("laws/{}.xml", info.uuid)],
+        autocommit::default_message("法令を追加", &info.name, &info.uuid),
+    )
 }
 
 fn cmd_validate(repo: &Repo, json: bool) -> Result<i32, String> {
@@ -382,7 +438,13 @@ fn cmd_rule(repo: &Repo, args: &Args, json: bool) -> Result<i32, String> {
             };
             let doc = rule::create(repo, &name, &category, &body)?;
             print_rule_created(&doc);
-            Ok(0)
+            finish_commit(
+                repo,
+                args,
+                false,
+                vec![format!("rules/{}.xml", doc.uuid)],
+                autocommit::default_message("ルールを追加", &doc.name, &doc.uuid),
+            )
         }
         "new" => {
             let name = args.opt("name").ok_or("`rule new` requires --name")?;
@@ -393,7 +455,13 @@ fn cmd_rule(repo: &Repo, args: &Args, json: bool) -> Result<i32, String> {
             } else {
                 print_rule_created(&doc);
             }
-            Ok(0)
+            finish_commit(
+                repo,
+                args,
+                json,
+                vec![format!("rules/{}.xml", doc.uuid)],
+                autocommit::default_message("ルールを追加", &doc.name, &doc.uuid),
+            )
         }
         "list" => {
             if json {
@@ -443,7 +511,13 @@ fn cmd_rule(repo: &Repo, args: &Args, json: bool) -> Result<i32, String> {
             } else {
                 println!("Updated {}", doc.path.display());
             }
-            Ok(0)
+            finish_commit(
+                repo,
+                args,
+                json,
+                vec![format!("rules/{}.xml", doc.uuid)],
+                autocommit::default_message("ルールを更新", &doc.name, &doc.uuid),
+            )
         }
         "path" => {
             let u = need_uuid(args, 2, "rule path")?;
@@ -453,6 +527,7 @@ fn cmd_rule(repo: &Repo, args: &Args, json: bool) -> Result<i32, String> {
         "edit" => {
             let u = need_uuid(args, 2, "rule edit")?;
             let path = rule::path_for(repo, &u)?;
+            let before = fs::read_to_string(&path).unwrap_or_default();
             let editor = env::var("VISUAL")
                 .or_else(|_| env::var("EDITOR"))
                 .unwrap_or_else(|_| "vi".to_string());
@@ -464,9 +539,20 @@ fn cmd_rule(repo: &Repo, args: &Args, json: bool) -> Result<i32, String> {
                 return Err(format!("editor '{}' exited with an error", editor));
             }
             match rule::load_file(&path) {
-                Ok(_) => {
+                Ok(doc) => {
                     println!("OK: {} is valid", path.display());
-                    Ok(0)
+                    let after = fs::read_to_string(&path).unwrap_or_default();
+                    if after != before {
+                        finish_commit(
+                            repo,
+                            args,
+                            false,
+                            vec![format!("rules/{}.xml", doc.uuid)],
+                            autocommit::default_message("ルールを編集", &doc.name, &doc.uuid),
+                        )
+                    } else {
+                        Ok(0)
+                    }
                 }
                 Err(errs) => {
                     eprintln!("{} is not valid:", path.display());
@@ -480,9 +566,15 @@ fn cmd_rule(repo: &Repo, args: &Args, json: bool) -> Result<i32, String> {
             if !args.flag("yes") {
                 return Err("refusing to delete without --yes".to_string());
             }
-            rule::delete(repo, &u)?;
-            println!("Deleted rule {} (its UUID is never reused; commit the deletion with Git)", u);
-            Ok(0)
+            let name = rule::delete_checked(repo, &u, None)?;
+            println!("Deleted rule {} (its UUID is never reused)", u);
+            finish_commit(
+                repo,
+                args,
+                false,
+                vec![format!("rules/{}.xml", u)],
+                autocommit::default_message("ルールを削除", &name, &u),
+            )
         }
         "validate" => {
             let r = rule::validate_all(repo)?;
@@ -498,6 +590,85 @@ fn cmd_rule(repo: &Repo, args: &Args, json: bool) -> Result<i32, String> {
         }
         other => Err(format!("unknown rule subcommand '{}'", other)),
     }
+}
+
+fn on_off(v: bool) -> &'static str {
+    if v {
+        "on"
+    } else {
+        "off"
+    }
+}
+
+fn cmd_config(repo: &Repo, args: &Args) -> Result<i32, String> {
+    let key = args.pos.get(1).map(|s| s.as_str());
+    let value = args.pos.get(2).map(|s| s.as_str());
+    match (key, value) {
+        (None, _) | (Some("autocommit"), None) => {
+            println!("autocommit = {}", on_off(autocommit::enabled(repo)));
+            Ok(0)
+        }
+        (Some("autocommit"), Some(v)) => {
+            let on = match v {
+                "on" | "true" | "1" => true,
+                "off" | "false" | "0" => false,
+                _ => return Err(format!("invalid value '{}' (use on or off)", v)),
+            };
+            repo.require_initialized()?;
+            autocommit::set_config(repo, on)?;
+            println!("autocommit = {} (saved in this repository's git config)", on_off(on));
+            Ok(0)
+        }
+        (Some(other), _) => Err(format!("unknown setting '{}' (available: autocommit)", other)),
+    }
+}
+
+fn cmd_search(repo: &Repo, args: &Args, json: bool) -> Result<i32, String> {
+    let q = args.pos[1..].join(" ");
+    if q.trim().is_empty() {
+        return Err("`search` requires a query".to_string());
+    }
+    let res = api::dispatch(repo, "search", &Json::obj(vec![("q", Json::Str(q))]))?;
+    if json {
+        println!("{}", res.dump());
+        return Ok(0);
+    }
+    if let Some(Json::Arr(hits)) = res.get("hits") {
+        for h in hits {
+            let g = |k: &str| h.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let matched = match h.get("matched") {
+                Some(Json::Arr(m)) => m.iter().filter_map(|x| x.as_str()).collect::<Vec<&str>>().join(","),
+                _ => String::new(),
+            };
+            println!("{}\t{}\t{}\t{}\t{}", g("kind"), g("uuid"), g("name"), matched, g("snippet"));
+        }
+    }
+    if res.get("truncated") == Some(&Json::Bool(true)) {
+        eprintln!("(more results exist; refine the query)");
+    }
+    Ok(0)
+}
+
+fn cmd_history(repo: &Repo, args: &Args, json: bool) -> Result<i32, String> {
+    let u = need_uuid(args, 1, "history")?;
+    let p = Json::obj(vec![("uuid", Json::str(&u))]);
+    let mut res = api::dispatch(repo, "law.history", &p)?;
+    if matches!(res.get("commits"), Some(Json::Arr(a)) if a.is_empty()) {
+        res = api::dispatch(repo, "rule.history", &p)?;
+    }
+    if json {
+        println!("{}", res.dump());
+        return Ok(0);
+    }
+    if let Some(Json::Arr(commits)) = res.get("commits") {
+        for c in commits {
+            let g = |k: &str| c.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let hash = g("hash");
+            let short: String = hash.chars().take(8).collect();
+            println!("{}\t{}\t{}\t{}", short, g("date"), g("author"), g("subject"));
+        }
+    }
+    Ok(0)
 }
 
 fn cmd_commit(repo: &Repo, args: &Args) -> Result<i32, String> {
@@ -517,7 +688,24 @@ fn cmd_serve(repo: Repo, args: &Args) -> Result<i32, String> {
         Some(t) => Some(t.to_string()),
         None => env::var("LAWGIT_TOKEN").ok().filter(|t| !t.is_empty()),
     };
-    server::serve(repo, &host, port, token)?;
+    let cors: Vec<String> = args
+        .opt("cors-origin")
+        .map(|s| {
+            s.split(',')
+                .map(|x| x.trim().to_string())
+                .filter(|x| !x.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+    server::serve(
+        repo,
+        &host,
+        port,
+        server::ServerConfig {
+            token,
+            cors_origins: cors,
+        },
+    )?;
     Ok(0)
 }
 

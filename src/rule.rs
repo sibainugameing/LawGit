@@ -16,7 +16,8 @@ use std::path::{Path, PathBuf};
 
 use crate::repo::{self, Report, Repo};
 use crate::util::{
-    clean_single_line, file_name_of, is_xml_char, now_utc_iso, write_atomic, write_new,
+    clean_single_line, content_version, file_name_of, is_xml_char, now_utc_iso, write_atomic,
+    write_new,
 };
 use crate::uuid;
 use crate::xml::{self, escape_text, Element};
@@ -31,6 +32,8 @@ pub struct RuleDoc {
     pub created: String,
     pub body: String,
     pub path: PathBuf,
+    /// Hash of the file content; changes whenever the file changes.
+    pub version: String,
 }
 
 /// Normalize line endings, reject characters illegal in XML, trim surrounding blank lines.
@@ -144,6 +147,7 @@ pub fn load_file(path: &Path) -> Result<RuleDoc, Vec<String>> {
             created,
             body,
             path: path.to_path_buf(),
+            version: content_version(src.as_bytes()),
         })
     } else {
         Err(errs)
@@ -216,6 +220,18 @@ pub fn create(repo: &Repo, name: &str, category: &str, body: &str) -> Result<Rul
     load_file(&path).map_err(|e| format!("internal: generated rule is invalid: {}", e.join("; ")))
 }
 
+fn check_version(current: &RuleDoc, expected: Option<&str>) -> Result<(), String> {
+    if let Some(v) = expected {
+        if v != current.version {
+            return Err(format!(
+                "conflict: rule {} was modified by someone else (current version {}, yours {})",
+                current.uuid, current.version, v
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Update name / category / body of an existing rule. The UUID and creation time are kept.
 pub fn update(
     repo: &Repo,
@@ -224,10 +240,23 @@ pub fn update(
     category: Option<&str>,
     body: Option<&str>,
 ) -> Result<RuleDoc, String> {
+    update_checked(repo, uuid_s, name, category, body, None)
+}
+
+/// Like `update`, but fails with `conflict: ...` if the stored version differs from `expected_version`.
+pub fn update_checked(
+    repo: &Repo,
+    uuid_s: &str,
+    name: Option<&str>,
+    category: Option<&str>,
+    body: Option<&str>,
+    expected_version: Option<&str>,
+) -> Result<RuleDoc, String> {
     if name.is_none() && category.is_none() && body.is_none() {
         return Err("invalid params: nothing to update (give name, category or body)".to_string());
     }
     let current = get(repo, uuid_s)?;
+    check_version(&current, expected_version)?;
     let new_name = match name {
         Some(n) => clean_single_line("name", n)?,
         None => current.name.clone(),
@@ -246,8 +275,23 @@ pub fn update(
 }
 
 pub fn delete(repo: &Repo, uuid_s: &str) -> Result<(), String> {
+    delete_checked(repo, uuid_s, None).map(|_| ())
+}
+
+/// Delete a rule (optionally only if its version matches). Returns the rule's display name.
+pub fn delete_checked(repo: &Repo, uuid_s: &str, expected_version: Option<&str>) -> Result<String, String> {
     let p = path_for(repo, uuid_s)?;
-    fs::remove_file(&p).map_err(|e| format!("internal: cannot delete {}: {}", p.display(), e))
+    let doc = load_file(&p).ok();
+    if expected_version.is_some() {
+        match &doc {
+            Some(d) => check_version(d, expected_version)?,
+            None => {
+                return Err("invalid: rule is not valid, so its version cannot be checked".to_string());
+            }
+        }
+    }
+    fs::remove_file(&p).map_err(|e| format!("internal: cannot delete {}: {}", p.display(), e))?;
+    Ok(doc.map(|d| d.name).unwrap_or_else(|| uuid_s.to_string()))
 }
 
 /// Filter by exact category and/or case-insensitive substring over name, category and body.

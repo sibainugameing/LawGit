@@ -102,6 +102,16 @@ pub fn write_atomic(path: &Path, content: &str) -> Result<(), String> {
     })
 }
 
+/// Stable 64-bit FNV-1a hash of the bytes, as 16 hex digits (used as an edit "version").
+pub fn content_version(bytes: &[u8]) -> String {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in bytes {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    format!("{:016x}", h)
+}
+
 pub fn file_name_of(path: &Path) -> String {
     path.file_name()
         .map(|s| s.to_string_lossy().to_string())
@@ -164,6 +174,13 @@ mod tests {
         assert!(clean_single_line("x", "a\nb").is_err());
         assert_eq!(clean_single_line("x", " a ").unwrap(), "a");
         assert_eq!(clean_optional("x", Some(" ")).unwrap(), None);
+    }
+
+    #[test]
+    fn version_is_stable_and_sensitive() {
+        assert_eq!(content_version(b""), "cbf29ce484222325");
+        assert_eq!(content_version(b"a"), content_version(b"a"));
+        assert_ne!(content_version(b"a"), content_version(b"b"));
     }
 
     #[test]

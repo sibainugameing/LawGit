@@ -20,10 +20,10 @@ cargo install --path .      # lawgit と git-law を ~/.cargo/bin へ
 
 ## 検証状況（正直な申告）
 
-- **Python 側（`tools/`）**: 23 件のオフラインテストを実行し、すべて通過済み（実 Git での履歴復元を含む）。
-- **Rust 側（`src/`, `tests/`）**: 開発環境に Rust ツールチェーンが無く、**コンパイル・テスト実行は未実施**です。全ソースの机上レビューと括弧対応の機械検査のみ行っています。
-  最初に `cargo build --release && cargo test && sh scripts/smoke.sh` を実行してください。`.github/workflows/ci.yml` を GitHub に push すると、同じ検証が自動で走ります。
-  エラーが出た場合は、エラー全文を共有してください。
+- **v0.1 の Rust 部分**: 利用者の環境で `cargo build --release && cargo test && sh scripts/smoke.sh` が全件通過したことを確認済みです（単体 16 件・統合 9 件・スモークテスト）。
+- **v0.2 で追加した Rust コード**（自動コミット・検索・履歴・競合検出・CORS・OpenAPI と、その統合テスト）: 開発環境にコンパイラが無く、**まだコンパイル・実行していません**。机上レビューと括弧対応の機械検査のみです。
+  同じコマンドで検証してください（エラーが出たら全文を共有してください）。`.github/workflows/ci.yml` を push すれば CI でも走ります。
+- **Python / JavaScript 側**（`tools/`, `clients/`）: テスト済み（tools 23 件、Python クライアント 8 件、JS クライアント 3 件。クライアントはモックサーバー相手で、実サーバーとの結合は Rust の統合テストが担当）。
 - **e-Gov API への実通信**は未確認です（`tools/egov_import.py` は dry-run・`--from-file` で安全に試せます）。
 
 ## クイックスタート
@@ -60,7 +60,7 @@ lawgit check                          # laws/ と rules/ をまとめて検証�
 
 ## Git ワークフロー
 
-Git が履歴エンジンです。LawGit は独自の履歴ファイルを作らず、**自動 commit もしません**。
+Git が履歴エンジンです。LawGit は独自の履歴ファイルを作りません。既定では自動 commit しません（下の「自動コミット」で有効化できます）。
 
 ```sh
 lawgit --repo legal-data validate
@@ -74,13 +74,41 @@ git commit -m "道路交通法：改正内容を記述"
 
 便利コマンド: `lawgit commit -m "メッセージ"`（全体を検証し、通った場合のみ `laws/` と `rules/` を add して commit）。
 
+### 自動コミット
+
+```sh
+lawgit config autocommit on     # このリポジトリで常に ON（git config に保存。共有されない）
+lawgit config autocommit off
+lawgit rule new --name X --commit        # この実行だけ ON（--no-commit で OFF）  /  LAWGIT_AUTOCOMMIT=1 でも可
+lawgit rule set <UUID> --body "..." -m "休暇日数を変更"   # メッセージ指定
+lawgit serve --commit            # HTTP API 経由の書き込みも自動コミット
+```
+
+- ON の間、`new` / `rule new・make・set・edit・delete` と API の書き込みは、**変更したファイルだけ**を **1 変更 = 1 commit** で記録します。
+  他にステージ済みの作業は巻き込まず、内容が変わらない場合は空 commit を作りません。
+- 既定のメッセージは「ルールを更新: 休暇規則 [UUID]」のような形式です。
+- commit に失敗（`user.name` / `user.email` 未設定など）しても保存済みの変更は残り、終了コード 1 と警告を返します。
+- 変更の履歴は `lawgit history <UUID>`（削除済みも可）、全文検索は `lawgit search 語句` で確認できます。
+
 ## 他アプリとの連携窓口 / Integration
 
 | 窓口 | コマンド |
 |---|---|
 | JSON 出力 | `lawgit list --json`, `show --json`, `validate --json`, `check --json`, `rule list --json` … |
 | stdio JSON-lines | `lawgit --repo DIR rpc` |
-| ローカル HTTP API | `lawgit --repo DIR serve [--host 127.0.0.1] [--port 8787] [--token T]` → `/api/v1/...` |
+| ローカル HTTP API | `lawgit --repo DIR serve [--host 127.0.0.1] [--port 8787] [--token T] [--cors-origin ORIGIN] [--commit]` → `/api/v1/...` |
+| OpenAPI 3 仕様 | `GET /api/v1/openapi.json` / `lawgit openapi` / [docs/openapi.json](docs/openapi.json)（コード生成にそのまま使える） |
+| クライアント | [clients/lawgit_client.py](clients/lawgit_client.py)（Python）・[clients/lawgit_client.mjs](clients/lawgit_client.mjs)（Node 18+/ブラウザ）。依存なし |
+
+主な機能: 法令・ルールの CRUD、**全文検索**（`/search`）、**履歴・過去版の取得**（削除済みも可）、**差分同期用の変更一覧**（`/changes?since=`）、
+**同時編集の競合検出**（`version` / `if_version` → 409）、**自動コミット**、ブラウザアプリ向けの**厳格な CORS**（完全一致オリジン＋トークン必須）。
+
+```python
+from lawgit_client import LawGitClient
+c = LawGitClient("http://127.0.0.1:8787")
+c.edit_rule(uuid, lambda r: {"body": r["body"] + "\n- 追記"})   # 競合しても自動リトライ
+for commit in c.watch(): print(commit["subject"])                # 新しい commit を追従
+```
 
 メソッド一覧・リクエスト例・安全設計は [docs/API.md](docs/API.md) を参照。
 
@@ -148,7 +176,9 @@ python3 tools/egov_import.py --repo legal-data --all --history --write --yes    
 | `check` | laws/ + rules/ の総合検証 |
 | `rule make/new/list/show/set/edit/path/delete/validate` | ルール管理 |
 | `commit -m` | 検証付き commit |
-| `serve` / `rpc` | 連携窓口 |
+| `config autocommit [on\|off]` | 自動コミットの設定 |
+| `search <語句>` / `history <UUID>` | 全文検索 / 変更履歴 |
+| `serve` / `rpc` / `openapi` | 連携窓口 / OpenAPI 出力 |
 
 `--repo` で対象リポジトリを指定（既定はカレントディレクトリ）。終了コード: 0 成功 / 1 検証エラー / 2 使用方法・実行エラー。
 

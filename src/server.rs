@@ -1,9 +1,10 @@
 //! Local HTTP/1.1 JSON API (`lawgit serve`). Standard library only.
 //!
 //! Safety defaults: binds to 127.0.0.1, serves one request at a time, limits
-//! request size, validates the Host header on loopback binds (DNS-rebinding),
+//! request size, validates the Host header on loopback binds (DNS rebinding),
 //! requires `Content-Type: application/json` for writes (so browsers need a
-//! CORS preflight, which is never granted), and supports an optional token.
+//! CORS preflight), and supports an optional token. CORS is opt-in per origin
+//! (`--cors-origin`) and then requires a token.
 
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
@@ -12,11 +13,18 @@ use std::time::Duration;
 
 use crate::api;
 use crate::json::{self, Json};
+use crate::openapi;
 use crate::repo::Repo;
 use crate::util::percent_decode;
 
 const MAX_HEADER: usize = 64 * 1024;
 const MAX_BODY: usize = 1024 * 1024;
+
+pub struct ServerConfig {
+    pub token: Option<String>,
+    /// Exact origins (e.g. `https://app.example.com`) allowed to call the API from a browser.
+    pub cors_origins: Vec<String>,
+}
 
 struct Request {
     method: String,
@@ -26,19 +34,46 @@ struct Request {
     body: Vec<u8>,
 }
 
-pub fn serve(repo: Repo, host: &str, port: u16, token: Option<String>) -> Result<(), String> {
+struct Reply {
+    code: u16,
+    body: String,
+    headers: String,
+}
+
+pub fn serve(repo: Repo, host: &str, port: u16, cfg: ServerConfig) -> Result<(), String> {
     repo.require_initialized()?;
     let loopback = host == "127.0.0.1" || host == "localhost" || host == "::1";
-    if !loopback && token.is_none() {
+    if !loopback && cfg.token.is_none() {
         return Err("binding to a non-loopback address requires --token".to_string());
+    }
+    if !cfg.cors_origins.is_empty() && cfg.token.is_none() {
+        return Err("--cors-origin requires --token".to_string());
+    }
+    for o in &cfg.cors_origins {
+        let ok = (o.starts_with("http://") || o.starts_with("https://"))
+            && !o.contains('*')
+            && !o.contains(char::is_whitespace)
+            && !o.ends_with('/');
+        if !ok {
+            return Err(format!(
+                "invalid --cors-origin '{}' (use exact origins like https://app.example.com; wildcards are not allowed)",
+                o
+            ));
+        }
     }
     let listener = TcpListener::bind((host, port))
         .map_err(|e| format!("cannot bind {}:{}: {}", host, port, e))?;
-    eprintln!("lawgit: serving {} on http://{}:{}/api/v1/ (Ctrl+C to stop)", repo.root.display(), host, port);
+    eprintln!(
+        "lawgit: serving {} on http://{}:{}/api/v1/ (auto-commit: {}) (Ctrl+C to stop)",
+        repo.root.display(),
+        host,
+        port,
+        if crate::autocommit::enabled(&repo) { "on" } else { "off" }
+    );
     for stream in listener.incoming() {
         match stream {
             Ok(s) => {
-                if let Err(e) = handle(&repo, s, token.as_deref(), loopback) {
+                if let Err(e) = handle(&repo, s, &cfg, loopback) {
                     eprintln!("lawgit: connection error: {}", e);
                 }
             }
@@ -143,42 +178,80 @@ fn read_request(stream: &mut TcpStream) -> Result<Request, String> {
 fn status_text(code: u16) -> &'static str {
     match code {
         200 => "OK",
+        204 => "No Content",
         400 => "Bad Request",
         401 => "Unauthorized",
         403 => "Forbidden",
         404 => "Not Found",
+        409 => "Conflict",
         415 => "Unsupported Media Type",
         500 => "Internal Server Error",
         _ => "OK",
     }
 }
 
-fn write_response(stream: &mut TcpStream, code: u16, body: &Json) -> io::Result<()> {
-    let payload = body.dump();
-    let head = format!(
-        "HTTP/1.1 {} {}\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: {}\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nConnection: close\r\n\r\n",
-        code,
-        status_text(code),
-        payload.len()
-    );
+fn write_reply(stream: &mut TcpStream, r: &Reply) -> io::Result<()> {
+    let head = if r.code == 204 {
+        format!(
+            "HTTP/1.1 204 No Content\r\n{}Content-Length: 0\r\nConnection: close\r\n\r\n",
+            r.headers
+        )
+    } else {
+        format!(
+            "HTTP/1.1 {} {}\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: {}\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\n{}Connection: close\r\n\r\n",
+            r.code,
+            status_text(r.code),
+            r.body.len(),
+            r.headers
+        )
+    };
     stream.write_all(head.as_bytes())?;
-    stream.write_all(payload.as_bytes())?;
+    if r.code != 204 {
+        stream.write_all(r.body.as_bytes())?;
+    }
     stream.flush()
 }
 
-fn err_body(msg: &str) -> Json {
-    api::envelope(Err(msg.to_string()))
+fn json_reply(code: u16, body: &Json) -> Reply {
+    Reply {
+        code,
+        body: body.dump(),
+        headers: String::new(),
+    }
 }
 
-fn handle(repo: &Repo, mut stream: TcpStream, token: Option<&str>, loopback: bool) -> io::Result<()> {
+fn err_reply(code: u16, msg: &str) -> Reply {
+    json_reply(code, &api::envelope(Err(msg.to_string())))
+}
+
+fn handle(repo: &Repo, mut stream: TcpStream, cfg: &ServerConfig, loopback: bool) -> io::Result<()> {
     stream.set_read_timeout(Some(Duration::from_secs(10)))?;
     stream.set_write_timeout(Some(Duration::from_secs(10)))?;
     let req = match read_request(&mut stream) {
         Ok(r) => r,
-        Err(msg) => return write_response(&mut stream, 400, &err_body(&msg)),
+        Err(msg) => return write_reply(&mut stream, &err_reply(400, &msg)),
     };
-    let (code, body) = route(repo, &req, token, loopback);
-    write_response(&mut stream, code, &body)
+    let origin = req.headers.get("origin").cloned().unwrap_or_default();
+    let origin_ok = !origin.is_empty() && cfg.cors_origins.iter().any(|a| *a == origin);
+    let mut reply = if req.method == "OPTIONS" {
+        if origin_ok {
+            Reply {
+                code: 204,
+                body: String::new(),
+                headers: "Access-Control-Allow-Methods: GET, POST, PUT, PATCH, DELETE, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type, Authorization, X-Lawgit-Token\r\nAccess-Control-Max-Age: 600\r\n".to_string(),
+            }
+        } else {
+            err_reply(403, "forbidden: origin not allowed")
+        }
+    } else {
+        route(repo, &req, cfg, loopback)
+    };
+    if origin_ok {
+        reply
+            .headers
+            .push_str(&format!("Access-Control-Allow-Origin: {}\r\nVary: Origin\r\n", origin));
+    }
+    write_reply(&mut stream, &reply)
 }
 
 fn host_name(h: &str) -> &str {
@@ -218,20 +291,47 @@ fn with_uuid(body: Json, id: &str) -> Json {
     }
 }
 
-fn run_method(repo: &Repo, method: &str, params: Json) -> (u16, Json) {
+/// Build call parameters from the query string (plus fixed `extra` pairs).
+fn query_params(req: &Request, extra: Vec<(&str, Json)>) -> Json {
+    let mut v = extra;
+    for key in ["q", "category", "query", "since", "if_version", "commit_message"] {
+        if let Some(val) = req.query.get(key) {
+            v.push((key, Json::str(val)));
+        }
+    }
+    if let Some(n) = req.query.get("limit").and_then(|s| s.parse::<f64>().ok()) {
+        v.push(("limit", Json::Num(n)));
+    }
+    Json::obj(v)
+}
+
+fn run_method(repo: &Repo, method: &str, params: Json) -> Reply {
     match api::dispatch(repo, method, &params) {
-        Ok(v) => (200, api::envelope(Ok(v))),
-        Err(e) => (api::status_for_error(&e), api::envelope(Err(e))),
+        Ok(v) => json_reply(200, &api::envelope(Ok(v))),
+        Err(e) => json_reply(api::status_for_error(&e), &api::envelope(Err(e))),
     }
 }
 
-fn route(repo: &Repo, req: &Request, token: Option<&str>, loopback: bool) -> (u16, Json) {
-    if let Some(t) = token {
+fn run_with_body(repo: &Repo, req: &Request, method: &str, id: Option<&str>) -> Reply {
+    match body_json(req) {
+        Ok(b) => {
+            let params = match id {
+                Some(i) => with_uuid(b, i),
+                None => b,
+            };
+            run_method(repo, method, params)
+        }
+        Err(e) => err_reply(400, &e),
+    }
+}
+
+fn route(repo: &Repo, req: &Request, cfg: &ServerConfig, loopback: bool) -> Reply {
+    if let Some(t) = cfg.token.as_deref() {
         let want = format!("Bearer {}", t);
         let by_bearer = req.headers.get("authorization").map(|v| *v == want).unwrap_or(false);
         let by_header = req.headers.get("x-lawgit-token").map(|v| v.as_str() == t).unwrap_or(false);
         if !by_bearer && !by_header {
-            return (401, err_body("unauthorized: missing or wrong token"));
+            return err_reply(401, "unauthorized: missing or wrong token");
         }
     } else if loopback {
         let host_ok = match req.headers.get("host") {
@@ -242,7 +342,7 @@ fn route(repo: &Repo, req: &Request, token: Option<&str>, loopback: bool) -> (u1
             None => true,
         };
         if !host_ok {
-            return (403, err_body("forbidden: unexpected Host header"));
+            return err_reply(403, "forbidden: unexpected Host header");
         }
     }
 
@@ -250,79 +350,75 @@ fn route(repo: &Repo, req: &Request, token: Option<&str>, loopback: bool) -> (u1
     if writes {
         let ct = req.headers.get("content-type").map(|v| v.to_lowercase()).unwrap_or_default();
         if !ct.contains("application/json") {
-            return (415, err_body("invalid: Content-Type must be application/json"));
+            return err_reply(415, "invalid: Content-Type must be application/json");
         }
     }
 
     let rest = match req.path.strip_prefix("/api/v1") {
         Some(r) => r,
-        None => return (404, err_body("not found: use /api/v1/...")),
+        None => return err_reply(404, "not found: use /api/v1/..."),
     };
     let segs: Vec<&str> = rest.split('/').filter(|s| !s.is_empty()).collect();
-
-    let list_params = || -> Json {
-        let mut v: Vec<(&str, Json)> = Vec::new();
-        if let Some(c) = req.query.get("category") {
-            v.push(("category", Json::str(c)));
-        }
-        if let Some(q) = req.query.get("query") {
-            v.push(("query", Json::str(q)));
-        }
-        Json::obj(v)
-    };
 
     match (req.method.as_str(), segs.as_slice()) {
         ("GET", ["ping"]) => run_method(repo, "ping", Json::Obj(Vec::new())),
         ("GET", ["methods"]) => run_method(repo, "methods", Json::Obj(Vec::new())),
         ("GET", ["validate"]) => run_method(repo, "repo.check", Json::Obj(Vec::new())),
+        ("GET", ["openapi.json"]) => Reply {
+            code: 200,
+            body: openapi::SPEC.to_string(),
+            headers: String::new(),
+        },
+        ("GET", ["search"]) => run_method(repo, "search", query_params(req, vec![])),
+        ("GET", ["changes"]) => run_method(repo, "changes", query_params(req, vec![])),
 
         ("GET", ["laws"]) => run_method(repo, "law.list", Json::Obj(Vec::new())),
         ("GET", ["laws", id]) => run_method(repo, "law.get", Json::obj(vec![("uuid", Json::str(id))])),
-        ("POST", ["laws"]) => match body_json(req) {
-            Ok(b) => run_method(repo, "law.create", b),
-            Err(e) => (400, err_body(&e)),
-        },
+        ("GET", ["laws", id, "history"]) => {
+            run_method(repo, "law.history", query_params(req, vec![("uuid", Json::str(id))]))
+        }
+        ("GET", ["laws", id, "revisions", rev]) => run_method(
+            repo,
+            "law.revision",
+            Json::obj(vec![("uuid", Json::str(id)), ("rev", Json::str(rev))]),
+        ),
+        ("POST", ["laws"]) => run_with_body(repo, req, "law.create", None),
 
-        ("GET", ["rules"]) => run_method(repo, "rule.list", list_params()),
+        ("GET", ["rules"]) => run_method(repo, "rule.list", query_params(req, vec![])),
         ("GET", ["rules", id]) => run_method(repo, "rule.get", Json::obj(vec![("uuid", Json::str(id))])),
-        ("POST", ["rules"]) => match body_json(req) {
-            Ok(b) => run_method(repo, "rule.create", b),
-            Err(e) => (400, err_body(&e)),
-        },
-        ("PUT", ["rules", id]) | ("PATCH", ["rules", id]) => match body_json(req) {
-            Ok(b) => run_method(repo, "rule.update", with_uuid(b, id)),
-            Err(e) => (400, err_body(&e)),
-        },
+        ("GET", ["rules", id, "history"]) => {
+            run_method(repo, "rule.history", query_params(req, vec![("uuid", Json::str(id))]))
+        }
+        ("GET", ["rules", id, "revisions", rev]) => run_method(
+            repo,
+            "rule.revision",
+            Json::obj(vec![("uuid", Json::str(id)), ("rev", Json::str(rev))]),
+        ),
+        ("POST", ["rules"]) => run_with_body(repo, req, "rule.create", None),
+        ("PUT", ["rules", id]) | ("PATCH", ["rules", id]) => {
+            run_with_body(repo, req, "rule.update", Some(*id))
+        }
         ("DELETE", ["rules", id]) => {
-            run_method(repo, "rule.delete", Json::obj(vec![("uuid", Json::str(id))]))
+            run_method(repo, "rule.delete", query_params(req, vec![("uuid", Json::str(id))]))
         }
 
         ("GET", ["git", "status"]) => run_method(repo, "git.status", Json::Obj(Vec::new())),
-        ("GET", ["git", "log"]) => {
-            let mut v: Vec<(&str, Json)> = Vec::new();
-            if let Some(l) = req.query.get("limit").and_then(|s| s.parse::<f64>().ok()) {
-                v.push(("limit", Json::Num(l)));
-            }
-            run_method(repo, "git.log", Json::obj(v))
-        }
-        ("POST", ["git", "commit"]) => match body_json(req) {
-            Ok(b) => run_method(repo, "git.commit", b),
-            Err(e) => (400, err_body(&e)),
-        },
+        ("GET", ["git", "log"]) => run_method(repo, "git.log", query_params(req, vec![])),
+        ("POST", ["git", "commit"]) => run_with_body(repo, req, "git.commit", None),
 
         ("POST", ["rpc"]) => match body_json(req) {
             Ok(b) => {
                 let method = b.get("method").and_then(|m| m.as_str()).unwrap_or("").to_string();
                 let params = b.get("params").cloned().unwrap_or(Json::Obj(Vec::new()));
                 if method.is_empty() {
-                    (400, err_body("invalid params: 'method' (string) is required"))
+                    err_reply(400, "invalid params: 'method' (string) is required")
                 } else {
                     run_method(repo, &method, params)
                 }
             }
-            Err(e) => (400, err_body(&e)),
+            Err(e) => err_reply(400, &e),
         },
 
-        _ => (404, err_body("not found: no such route or method")),
+        _ => err_reply(404, "not found: no such route or method"),
     }
 }

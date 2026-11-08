@@ -5,7 +5,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::repo::{self, Report, Repo};
-use crate::util::{clean_optional, clean_single_line, file_name_of, write_new};
+use crate::util::{clean_optional, clean_single_line, content_version, file_name_of, write_new};
 use crate::uuid;
 use crate::xml::{self, escape_text, Element};
 
@@ -17,6 +17,8 @@ pub struct LawInfo {
     pub law_number: Option<String>,
     pub e_gov_id: Option<String>,
     pub path: PathBuf,
+    /// Hash of the file content; changes whenever the file changes.
+    pub version: String,
 }
 
 pub struct NewLaw {
@@ -150,6 +152,7 @@ pub fn load_file(path: &Path) -> Result<LawInfo, Vec<String>> {
             law_number,
             e_gov_id: egov,
             path: path.to_path_buf(),
+            version: content_version(src.as_bytes()),
         })
     } else {
         Err(errs)

@@ -7,6 +7,8 @@ use crate::check;
 use crate::json::Json;
 use crate::repo::Repo;
 
+const LOG_FORMAT: &str = "--pretty=format:%H%x09%an%x09%aI%x09%s";
+
 pub fn run_git(root: &Path, args: &[&str]) -> Result<String, String> {
     let output = Command::new("git")
         .arg("-C")
@@ -29,17 +31,29 @@ pub fn status(repo: &Repo) -> Result<String, String> {
     run_git(&repo.root, &["status", "--porcelain=v1"])
 }
 
-/// Recent commits as JSON objects: hash, author, date, subject.
-pub fn log(repo: &Repo, limit: usize) -> Result<Json, String> {
+/// True for a 4-40 digit hexadecimal commit id (never an option or a ref name).
+pub fn is_hex_rev(rev: &str) -> bool {
+    (4..=40).contains(&rev.len()) && rev.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+fn is_unborn(e: &str) -> bool {
+    e.contains("does not have any commits") || e.contains("bad default revision")
+}
+
+/// Recent commits (optionally only those touching `paths`) as JSON objects:
+/// hash, author, date, subject. A repository without commits yields an empty list.
+pub fn log_paths(repo: &Repo, limit: usize, paths: &[&str]) -> Result<Json, String> {
     repo.require_initialized()?;
     let n = format!("-n{}", limit.clamp(1, 500));
-    let out = match run_git(
-        &repo.root,
-        &["log", n.as_str(), "--pretty=format:%H%x09%an%x09%aI%x09%s"],
-    ) {
+    let mut args: Vec<&str> = vec!["log", n.as_str(), LOG_FORMAT];
+    if !paths.is_empty() {
+        args.push("--");
+        args.extend(paths.iter().copied());
+    }
+    let out = match run_git(&repo.root, &args) {
         Ok(o) => o,
         Err(e) => {
-            if e.contains("does not have any commits") {
+            if is_unborn(&e) {
                 String::new()
             } else {
                 return Err(e);
@@ -59,6 +73,92 @@ pub fn log(repo: &Repo, limit: usize) -> Result<Json, String> {
         }
     }
     Ok(Json::Arr(items))
+}
+
+pub fn log(repo: &Repo, limit: usize) -> Result<Json, String> {
+    log_paths(repo, limit, &[])
+}
+
+/// File content at a given commit (`rel` must be a repository-relative path built by the caller).
+pub fn show_at(repo: &Repo, rev: &str, rel: &str) -> Result<String, String> {
+    repo.require_initialized()?;
+    if !is_hex_rev(rev) {
+        return Err("invalid params: rev must be a 4-40 digit hexadecimal commit id".to_string());
+    }
+    let spec = format!("{}:{}", rev, rel);
+    run_git(&repo.root, &["show", spec.as_str()])
+        .map_err(|e| format!("not found: {} at revision {} ({})", rel, rev, e))
+}
+
+/// Commits (newest first) with the files each one changed. With `since`, only commits after it.
+pub fn changes(repo: &Repo, since: Option<&str>, limit: usize) -> Result<Json, String> {
+    repo.require_initialized()?;
+    let n = format!("-n{}", limit.clamp(1, 500));
+    let range = match since {
+        Some(s) => {
+            if !is_hex_rev(s) {
+                return Err("invalid params: since must be a 4-40 digit hexadecimal commit id".to_string());
+            }
+            format!("{}..HEAD", s)
+        }
+        None => String::new(),
+    };
+    let mut args: Vec<&str> = vec![
+        "log",
+        n.as_str(),
+        "--name-status",
+        "--no-renames",
+        "--pretty=format:%x01%H%x09%aI%x09%s",
+    ];
+    if since.is_some() {
+        args.push(range.as_str());
+    }
+    let out = match run_git(&repo.root, &args) {
+        Ok(o) => o,
+        Err(e) => {
+            if is_unborn(&e) {
+                String::new()
+            } else {
+                return Err(e);
+            }
+        }
+    };
+    let mut items = Vec::new();
+    for chunk in out.split('\u{1}') {
+        if chunk.trim().is_empty() {
+            continue;
+        }
+        let mut lines = chunk.lines();
+        let head = lines.next().unwrap_or("");
+        let parts: Vec<&str> = head.splitn(3, '\t').collect();
+        if parts.len() < 3 {
+            continue;
+        }
+        let mut files = Vec::new();
+        for l in lines {
+            let l = l.trim_end();
+            if l.is_empty() {
+                continue;
+            }
+            let mut it = l.splitn(2, '\t');
+            let st = it.next().unwrap_or("");
+            let path = it.next().unwrap_or("");
+            if !path.is_empty() {
+                files.push(Json::obj(vec![("status", Json::str(st)), ("path", Json::str(path))]));
+            }
+        }
+        items.push(Json::obj(vec![
+            ("hash", Json::str(parts[0])),
+            ("date", Json::str(parts[1])),
+            ("subject", Json::str(parts[2])),
+            ("files", Json::Arr(files)),
+        ]));
+    }
+    let head = match run_git(&repo.root, &["rev-parse", "HEAD"]) {
+        Ok(h) => Json::Str(h.trim().to_string()),
+        Err(_) => Json::Null,
+    };
+    Ok(Json::obj(vec![("head", head), ("commits", Json::Arr(items))]))
 }
 
 /// Validate everything, stage `laws/` and `rules/`, and commit with `message`.

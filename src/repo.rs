@@ -10,6 +10,8 @@ use crate::uuid;
 
 pub struct Repo {
     pub root: PathBuf,
+    /// Per-process override of the auto-commit setting (`--commit` / `--no-commit`).
+    pub auto_commit: Option<bool>,
 }
 
 /// Valid items plus human-readable problems found while scanning a directory.
@@ -20,7 +22,15 @@ pub struct Report<T> {
 
 impl Repo {
     pub fn new<P: Into<PathBuf>>(root: P) -> Repo {
-        Repo { root: root.into() }
+        Repo {
+            root: root.into(),
+            auto_commit: None,
+        }
+    }
+
+    pub fn with_auto_commit(mut self, value: Option<bool>) -> Repo {
+        self.auto_commit = value;
+        self
     }
 
     pub fn laws_dir(&self) -> PathBuf {

@@ -17,6 +17,15 @@ printf '運用規則\n運用\n# 見出し\n.. はリテラル\n.\n' | "$BIN" --r
 "$BIN" --repo "$D" rule list --json
 printf '%s\n' '{"id":1,"method":"ping"}' '{"id":2,"method":"repo.check"}' | "$BIN" --repo "$D" rpc
 
+# auto-commit, search, history
+"$BIN" --repo "$D" config autocommit on
+U=$("$BIN" --repo "$D" rule new --name "自動コミット規則" --body "年次有給休暇" | sed -n 's/^UUID: //p')
+"$BIN" --repo "$D" rule set "$U" --body "年次有給休暇は年5日"
+"$BIN" --repo "$D" search 有給
+"$BIN" --repo "$D" history "$U"
+git -C "$D" log --oneline
+"$BIN" --repo "$D" openapi | head -c 80; echo
+
 # HTTP
 "$BIN" --repo "$D" serve --port 18787 &
 PID=$!
@@ -25,6 +34,10 @@ curl -sf http://127.0.0.1:18787/api/v1/ping
 curl -sf http://127.0.0.1:18787/api/v1/rules
 curl -sf -X POST http://127.0.0.1:18787/api/v1/rules \
   -H 'Content-Type: application/json' -d '{"name":"API経由","body":"x"}'
+curl -sf "http://127.0.0.1:18787/api/v1/search?q=%E6%9C%89%E7%B5%A6"
+curl -sf "http://127.0.0.1:18787/api/v1/changes?limit=3"
+curl -sf http://127.0.0.1:18787/api/v1/openapi.json | head -c 80
 kill $PID
+wait $PID 2>/dev/null || true
 echo
 echo "SMOKE TEST PASSED"
