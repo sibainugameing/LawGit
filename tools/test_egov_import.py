@@ -122,6 +122,21 @@ class AllTests(unittest.TestCase):
         self.assertTrue(list_calls)
         query = E.urllib.parse.parse_qs(E.urllib.parse.urlparse(list_calls[0]).query)
         self.assertEqual(query["promulgation_date_from"], ["2020-01-01"])
+
+    def test_promulgation_filter_can_dispatch_history_mode(self):
+        original_list, original_history = E.list_all_law_ids, E.run_history
+        captured = {}
+        E.list_all_law_ids = lambda *a, **kw: ["A1", "A2"]
+        E.run_history = lambda args, repo, law_ids, known: captured.update(
+            history=args.history, ids=law_ids
+        ) or 0
+        try:
+            rc = E.main(["--repo", str(self.d), "--promulgated-from", "2020-01-01", "--history"])
+        finally:
+            E.list_all_law_ids, E.run_history = original_list, original_history
+        self.assertEqual(rc, 0)
+        self.assertTrue(captured["history"])
+        self.assertEqual(captured["ids"], ["A1", "A2"])
         self.assertFalse(any("law_file" in c for c in self.calls))
         self.assertEqual(list((self.d / "laws").glob("*.xml")), [])
 
