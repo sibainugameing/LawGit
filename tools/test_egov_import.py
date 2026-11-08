@@ -83,6 +83,21 @@ class AllTests(unittest.TestCase):
         self.assertEqual(E.list_all_law_ids(), ["A0", "A1", "A2", "A3", "A4"])
         self.assertEqual(E.list_all_law_ids(max_items=2), ["A0", "A1"])
 
+    def test_promulgation_date_filters_are_sent_to_api(self):
+        self.assertEqual(
+            E.list_all_law_ids(promulgated_from="2020-01-01", promulgated_to="2020-12-31"),
+            ["A0", "A1", "A2", "A3", "A4"],
+        )
+        query = E.urllib.parse.parse_qs(E.urllib.parse.urlparse(self.calls[-2]).query)
+        self.assertEqual(query["promulgation_date_from"], ["2020-01-01"])
+        self.assertEqual(query["promulgation_date_to"], ["2020-12-31"])
+
+    def test_promulgation_date_filter_validation(self):
+        with self.assertRaises(E.ImportError_):
+            E.list_all_law_ids(promulgated_from="2020-02-30")
+        with self.assertRaises(E.ImportError_):
+            E.list_all_law_ids(promulgated_from="2021-01-01", promulgated_to="2020-12-31")
+
     def test_all_dry_run_downloads_nothing(self):
         rc = E.main(["--repo", str(self.d), "--all"])
         self.assertEqual(rc, 0)
@@ -101,9 +116,17 @@ class AllTests(unittest.TestCase):
         self.assertEqual(len(list((self.d / "laws").glob("*.xml"))), 5)
         self.assertEqual(len([c for c in self.calls if "law_file" in c]) - before, 2)  # only A3, A4
 
+    def test_promulgation_filter_can_be_used_without_all(self):
+        self.assertEqual(E.main(["--repo", str(self.d), "--promulgated-from", "2020-01-01"]), 0)
+        list_calls = [c for c in self.calls if "/laws?" in c]
+        self.assertTrue(list_calls)
+        query = E.urllib.parse.parse_qs(E.urllib.parse.urlparse(list_calls[0]).query)
+        self.assertEqual(query["promulgation_date_from"], ["2020-01-01"])
+
     def test_option_conflicts(self):
         self.assertEqual(E.main(["--repo", str(self.d), "--all", "A1"]), 2)
         self.assertEqual(E.main(["--repo", str(self.d), "--max", "3", "A1"]), 2)
+        self.assertEqual(E.main(["--repo", str(self.d), "--promulgated-from", "2020-01-01", "A1"]), 2)
         self.assertEqual(E.main(["--repo", str(self.d), "--all", "--delay", "0.1"]), 2)
 
     def test_abort_after_consecutive_failures(self):
