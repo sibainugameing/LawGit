@@ -139,9 +139,13 @@ python3 tools/egov_import.py --repo legal-data --promulgated-from 2020-01-01
 python3 tools/egov_import.py --repo legal-data \
   --promulgated-from 2020-01-01 --promulgated-to 2020-12-31
 
-# 2020年以降に公布された法令から、まず 5 件だけ試す
+# 2020年以降に公布された法令を実際に取り込む
 python3 tools/egov_import.py --repo legal-data \
-  --promulgated-from 2020-01-01 --max 5
+  --promulgated-from 2020-01-01 --write
+
+# まず 5 件だけ実際に取り込んで確認する
+python3 tools/egov_import.py --repo legal-data \
+  --promulgated-from 2020-01-01 --max 5 --write
 ```
 
 - `--promulgated-from` は指定日以後、`--promulgated-to` は指定日以前を含みます。どちらか一方だけでも指定できます。
