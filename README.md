@@ -129,6 +129,26 @@ lawgit --repo legal-data validate && cd legal-data && git diff   # 確認して�
 - DOCTYPE / ENTITY を含む XML は解析前に拒否。取得データは実行・評価しない。
 - 既に取り込み済みの法令は `--update` を付けない限り上書きしない。UUID は既存のものを保持（不変）。自動 commit はしない。
 - 変換: `LawNum`→`law-number`、`LawType`→`type`（Act→法律 など）、`LawTitle`→`name`、`LawBody` 配下→`<body>`（e-Gov の要素語彙のまま構造保持）。
+### 公布日で範囲指定したインポート
+
+```sh
+# 2020年1月1日以降に公布された法令（終了日は省略可能）
+python3 tools/egov_import.py --repo legal-data --promulgated-from 2020-01-01
+
+# 2020年中に公布された法令（両端の日付を含む）
+python3 tools/egov_import.py --repo legal-data \
+  --promulgated-from 2020-01-01 --promulgated-to 2020-12-31
+
+# 2020年以降に公布された法令から、まず 5 件だけ試す
+python3 tools/egov_import.py --repo legal-data \
+  --promulgated-from 2020-01-01 --max 5
+```
+
+- `--promulgated-from` は指定日以後、`--promulgated-to` は指定日以前を含みます。どちらか一方だけでも指定できます。
+- e-Gov API v2 の一覧 API（`/laws`）に `promulgation_date_from` / `promulgation_date_to` を渡して絞り込みます。全一覧を取得してからローカルで除外する方式ではありません。
+- 日付範囲を指定すると一覧取得モードになり、`--all` は不要です。日付フィルターは法令そのものの公布日が対象で、改正履歴の公布日・施行日を絞るものではありません。
+- 既定は dry-run です。対象 ID と件数を確認してから `--write` を付けてください。
+
 ### 全法令の一括インポート
 
 ```sh
@@ -137,7 +157,7 @@ python3 tools/egov_import.py --repo legal-data --all --max 5 --write --yes      
 python3 tools/egov_import.py --repo legal-data --all --write --yes --delay 1.0    # 全件（数千リクエスト＝数時間）
 ```
 
-- 一覧 API（`/laws`）をページ送りして全法令の ID を収集し、順に取り込みます。`--all --write` は誤爆防止のため `--yes` が必要です。
+- 一覧 API（`/laws`）をページ送りして全法令の ID を収集し、順に取り込みます。日付フィルターなしの `--all --write` は誤爆防止のため `--yes` が必要です。
 - 取り込み済みの法令は自動でスキップするので、中断しても再実行で続きから再開できます。10 回連続で失敗したら中止します。
 - `--delay`（既定 1 秒、最小 0.5 秒）で公開 API への負荷を抑えます。
 
