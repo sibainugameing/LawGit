@@ -122,6 +122,8 @@ class AllTests(unittest.TestCase):
         self.assertTrue(list_calls)
         query = E.urllib.parse.parse_qs(E.urllib.parse.urlparse(list_calls[0]).query)
         self.assertEqual(query["promulgation_date_from"], ["2020-01-01"])
+        self.assertFalse(any("law_file" in c for c in self.calls))
+        self.assertEqual(list((self.d / "laws").glob("*.xml")), [])
 
     def test_option_conflicts(self):
         self.assertEqual(E.main(["--repo", str(self.d), "--all", "A1"]), 2)
