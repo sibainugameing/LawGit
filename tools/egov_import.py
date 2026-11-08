@@ -111,10 +111,31 @@ def fetch_law_xml(law_id: str, asof: str | None) -> bytes:
     return _get(url, "application/xml")
 
 
-def list_all_law_ids(asof: str | None = None, max_items: int | None = None, delay: float = 1.0) -> list[str]:
-    """Page through GET /laws and collect every law ID (validated, de-duplicated)."""
+def validate_promulgation_range(promulgated_from: str | None, promulgated_to: str | None) -> None:
+    """Validate inclusive YYYY-MM-DD bounds for the /laws promulgation-date filters."""
+    parsed = {}
+    for option, value in (("--promulgated-from", promulgated_from),
+                          ("--promulgated-to", promulgated_to)):
+        if value is None:
+            continue
+        if not ASOF_RE.match(value):
+            raise ImportError_(f"{option} must be YYYY-MM-DD")
+        try:
+            parsed[option] = datetime.date.fromisoformat(value)
+        except ValueError:
+            raise ImportError_(f"{option} is not a valid calendar date: {value}")
+    if ("--promulgated-from" in parsed and "--promulgated-to" in parsed
+            and parsed["--promulgated-from"] > parsed["--promulgated-to"]):
+        raise ImportError_("--promulgated-from must be on or before --promulgated-to")
+
+
+def list_all_law_ids(asof: str | None = None, max_items: int | None = None, delay: float = 1.0,
+                     promulgated_from: str | None = None,
+                     promulgated_to: str | None = None) -> list[str]:
+    """Page through GET /laws and collect IDs matching optional inclusive promulgation-date bounds."""
     if asof and not ASOF_RE.match(asof):
         raise ImportError_("--asof must be YYYY-MM-DD")
+    validate_promulgation_range(promulgated_from, promulgated_to)
     ids: list[str] = []
     seen: set[str] = set()
     offset = 0
@@ -122,6 +143,10 @@ def list_all_law_ids(asof: str | None = None, max_items: int | None = None, dela
         q = {"limit": LIST_PAGE_SIZE, "offset": offset, "response_format": "json"}
         if asof:
             q["asof"] = asof
+        if promulgated_from:
+            q["promulgation_date_from"] = promulgated_from
+        if promulgated_to:
+            q["promulgation_date_to"] = promulgated_to
         raw = _get(f"{API_BASE}/laws?" + urllib.parse.urlencode(q), "application/json")
         try:
             data = json.loads(raw.decode("utf-8"))
@@ -650,7 +675,12 @@ def _main_impl(argv: list[str]) -> int:
     ap.add_argument("--repo", default=".", help="lawgit repository (must contain laws/)")
     ap.add_argument("--all", action="store_true",
                     help="import EVERY law listed by e-Gov (thousands of requests; needs --yes together with --write)")
-    ap.add_argument("--max", type=int, default=None, metavar="N", help="with --all: stop after N laws (for trial runs)")
+    ap.add_argument("--promulgated-from", metavar="YYYY-MM-DD",
+                    help="with list import: include laws promulgated on or after this date (inclusive)")
+    ap.add_argument("--promulgated-to", metavar="YYYY-MM-DD",
+                    help="with list import: include laws promulgated on or before this date (inclusive)")
+    ap.add_argument("--max", type=int, default=None, metavar="N",
+                    help="with --all or promulgation-date filters: stop after N matching laws (for trial runs)")
     ap.add_argument("--delay", type=float, default=1.0, metavar="SEC",
                     help=f"seconds between requests (default 1.0, minimum {MIN_DELAY})")
     ap.add_argument("--yes", action="store_true", help="confirm a bulk --all --write run")
@@ -672,9 +702,17 @@ def _main_impl(argv: list[str]) -> int:
     if not (repo / "laws").is_dir():
         print(f"error: {repo}/laws not found; run `lawgit --repo {repo} init` first", file=sys.stderr)
         return 2
-    modes = [bool(args.from_file), bool(args.law_ids), args.all]
+    has_promulgation_filter = bool(args.promulgated_from or args.promulgated_to)
+    list_mode = args.all or has_promulgation_filter
+    modes = [bool(args.from_file), bool(args.law_ids), list_mode]
     if sum(modes) != 1:
-        print("error: give exactly one of: law IDs, --all, --from-file", file=sys.stderr)
+        print("error: give exactly one of: law IDs, list filters (--all / --promulgated-from / --promulgated-to), --from-file",
+              file=sys.stderr)
+        return 2
+    try:
+        validate_promulgation_range(args.promulgated_from, args.promulgated_to)
+    except ImportError_ as e:
+        print(f"error: {e}", file=sys.stderr)
         return 2
     if args.from_file and not (args.law_id and LAW_ID_RE.match(args.law_id)):
         print("error: --from-file requires a valid --law-id", file=sys.stderr)
@@ -685,8 +723,9 @@ def _main_impl(argv: list[str]) -> int:
     if (args.include_unenforced or args.refresh) and not args.history:
         print("error: --include-unenforced / --refresh require --history", file=sys.stderr)
         return 2
-    if args.max is not None and (not args.all or args.max < 1):
-        print("error: --max must be >= 1 and is only valid with --all", file=sys.stderr)
+    if args.max is not None and (not list_mode or args.max < 1):
+        print("error: --max must be >= 1 and is only valid with --all or promulgation-date filters",
+              file=sys.stderr)
         return 2
     if args.delay < MIN_DELAY:
         print(f"error: --delay must be at least {MIN_DELAY} seconds", file=sys.stderr)
@@ -708,9 +747,13 @@ def _main_impl(argv: list[str]) -> int:
             print("error: file too large", file=sys.stderr)
             return 2
         jobs.append((args.law_id, raw))
-    elif args.all:
+    elif list_mode:
         try:
-            all_ids = list_all_law_ids(args.asof, args.max, args.delay)
+            all_ids = list_all_law_ids(
+                args.asof, args.max, args.delay,
+                promulgated_from=args.promulgated_from,
+                promulgated_to=args.promulgated_to,
+            )
         except ImportError_ as e:
             print(f"error: cannot list laws: {e}", file=sys.stderr)
             return 2
